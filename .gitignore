@@ -1,0 +1,20 @@
+# local PDF cache + extracted text — regenerable, not in git
+Archiv/
+data/
+
+# Claude Code per-user settings + OneDrive sync metadata
+.claude/
+.DS_Store
+.[0-9A-F]*-[0-9A-F]*-[0-9A-F]*-[0-9A-F]*-[0-9A-F]*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# editors
+.vscode/
+.idea/

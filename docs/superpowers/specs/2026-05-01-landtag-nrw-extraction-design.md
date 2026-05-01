@@ -8,11 +8,15 @@
 
 Extract structured data on **Kleine Anfragen** from the public Landtag NRW parliamentary-document search at `https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html` into a local Excel store, with the full answer text persisted as Markdown files alongside the source PDFs.
 
-In scope: document type **Kleine Anfrage** only; operating modes by `--wahlperiode N` and/or `--from / --to`, with idempotent incremental backfill on subsequent runs; LLM use limited to opt-in plausibility/rescue checks routed through the [`llm`](https://pypi.org/project/llm/) library (default backend: local Ollama).
+In scope: document type **Kleine Anfrage** only; operating modes by `--wahlperiode N` (and an optional client-side `--from / --to` date filter applied after fetching); idempotent incremental backfill on subsequent runs; LLM use limited to opt-in plausibility/rescue checks routed through the [`llm`](https://pypi.org/project/llm/) library (default backend: local Ollama).
 
 Out of scope: Große and Mündliche Anfrage; GUI or database backend; cross-Wahlperiode merging beyond what the upsert key gives.
 
 The design honours CLAUDE.md's "as simple and low-level as possible": one `landtag.py` script (no `src/` package, no `pyproject.toml`), thin wrapper around an XLSX file plus the existing local PDF cache.
+
+### 1.1 robots.txt status (acknowledged risk)
+
+`https://www.landtag.nrw.de/robots.txt` `Disallow`s `/home/dokumente/dokumentensuche/` for all user-agents. The `crawl` verb deliberately disregards this for the journalistic / public-interest purpose of this project. The PDF directory `/portal/WWW/dokumentenarchiv/Dokument/MMD18-*.pdf` is **not** disallowed for WP18, so `fetch-text` is robots-clean. Politeness is preserved via a 1 rps shared budget plus an identifying User-Agent. Older Wahlperioden (10–15) are PDF-disallowed by robots.txt; if scope expands beyond WP18/19, revisit.
 
 ## 2. Use cases
 
@@ -30,7 +34,7 @@ Archiv/**/MMD18-*.pdf
         │
         ▼
 landtag scan-archive ──► index.xlsx     (cols: WP, Kleine_Anfrage_Nr,
-   pdftotext page 1                       Drucksache_*_Nr, Anfrager, Fraktion,
+   pdftotext pages 1-3                    Drucksache_*_Nr, Anfrager, Fraktion,
    regex extraction                       Anfragedatum, Anfragetitel,
    no network                             Antwortdatum, Ministerium,
                                           status='pending_enrich')
@@ -53,9 +57,11 @@ landtag verify         (read-only report; optional --llm-* enrichment)
 
 ### 3.2 Approach choices
 
-- **PDF-page-1 extraction is rule-based.** `pdftotext -layout -f 1 -l 1` plus 8 anchored regexes. Failures → row marked `extract_failed`, never silent.
-- **Spring Webflow handshake for crawl.** httpx + BeautifulSoup. The search form requires two session-scoped tokens scraped from the search-page HTML on a single bootstrap GET: `webflowToken` (a UUID) and a `webflowexecution…__searchr2020=eXsY` flow-execution parameter. The `JSESSIONID` cookie is held by an `httpx.Client` for the run. Pagination follows the next-page flow token returned in each result page. No browser dependency.
-- **Targeted crawl, not bulk by default.** After `scan-archive` populates ~18,000 rows, `crawl` need only enrich the ones with `Systematik`/`Schlagworte` empty and discover new `Drucksache_Antwort_Nr` values not yet in the store. A `--full` flag re-paginates the entire result set when needed.
+- **PDF first-3-pages extraction is rule-based.** `pdftotext -layout -f 1 -l 3` plus 7 anchored regexes (verified at 100% match on a 30-PDF random sample of WP18). Failures → row marked `extract_failed`, never silent. Page count of 3 is needed because the Ministerium statement spills past page 1 in long-Vorbemerkung documents (~10% of the sample).
+- **Spring Webflow handshake for crawl.** httpx + BeautifulSoup. The search form action URL itself carries the two session-scoped tokens: `webflowToken=<UUID>` and `webflowexecution<rand>__searchr2020=eXsY`. Both are scraped from the search-page HTML on a single bootstrap GET; the `JSESSIONID` and `TS01a5776e` cookies are held by an `httpx.Client` for the run. Pagination follows the next-page flow token returned in each result page. No browser dependency.
+- **Targeted crawl, not bulk by default.** After `scan-archive` populates ~18,000 rows, `crawl` need only enrich the ones with `Systematik`/`Schlagworte` empty. Enrich queries use the form's `nummer=18/N` field — one search per row gives a one-hit result page that's trivial to parse. A `--full` flag re-paginates the entire result set when discovery of new Drucksachen is needed.
+- **Date filter is client-side.** The search form has no `datum von` / `datum bis` inputs. `--from / --to` flags filter on `Anfragedatum` after a `--wahlperiode`-scoped fetch.
+- **No vocab subsystem.** The search page exposes only one scrapable select (`autor`), and even that is JS-populated (zero options server-side). `fraktion` is a free-text input, `ministerium` doesn't exist as a form field. The cost of building a JS-driven scraper exceeds the value, so vocab validation is reduced to: hardcoded Fraktion check (`CDU`/`SPD`/`GRÜNE`/`FDP`/`AfD`/`fraktionslos`) and an append-only `vocab_novelty.log` for any unseen Ministerium or Fraktion text — operator decides what to do.
 
 ### 3.3 File layout
 
@@ -64,10 +70,7 @@ landtag.py                 ← all verbs, helpers inline (no src/ package)
 test_landtag.py            ← only when a real bug demands it (initially empty)
 data/
 ├── index.xlsx
-├── fraktionen.xlsx
-├── ministerien.xlsx
-├── abgeordnete.xlsx
-├── vocab_mismatch.log
+├── vocab_novelty.log
 ├── crawl_errors.log
 └── extract_errors.log
 Archiv/
@@ -88,15 +91,15 @@ Buckets are 2000-wide partitions of the Drucksache number. `archive_lookup(N)` w
 | # | Column | Source | Notes |
 |---|---|---|---|
 | 1 | `WP` | Archiv path / search filter | Integer |
-| 2 | `Kleine_Anfrage_Nr` | PDF p.1 (`Kleine Anfrage 366`) | **Sequential nr.** Empty if extraction failed. |
-| 3 | `Drucksache_Anfrage_Nr` | PDF p.1 (`Drucksache 18/675`) | Question Drucksache |
+| 2 | `Kleine_Anfrage_Nr` | PDF (`Kleine Anfrage 366`) | **Sequential nr.** Empty if extraction failed. |
+| 3 | `Drucksache_Anfrage_Nr` | PDF (line after Anfrager+Fraktion) | Question Drucksache, e.g. `18/675` |
 | 4 | `Drucksache_Antwort_Nr` | filename `MMD18-1006.pdf` / search | **Unique key for upsert.** |
-| 5 | `Anfrager` | PDF p.1 (`des Abgeordneten …`) | Multiple co-signers `; ` joined |
-| 6 | `Fraktion` | PDF p.1 (trailing token after Anfrager) | Validated against vocab |
-| 7 | `Anfragedatum` | PDF p.1 (`vom 24. August 2022`) | ISO `YYYY-MM-DD` |
-| 8 | `Anfragetitel` | PDF p.1 (bold heading) | Useful for analytics scan |
-| 9 | `Antwortdatum` | PDF p.1 header date | ISO |
-| 10 | `Ministerium` | PDF p.1 (`Der Minister …`) | Mapped to Kürzel via vocab table |
+| 5 | `Anfrager` | PDF (`des Abgeordneten …` / `der Abgeordneten …`) | Multiple co-signers `; ` joined |
+| 6 | `Fraktion` | PDF (token after Anfrager) | Validated against hardcoded list |
+| 7 | `Anfragedatum` | PDF (`vom 24. August 2022`) | ISO `YYYY-MM-DD` |
+| 8 | `Anfragetitel` | PDF (between Anfrage-Drucksache and `Vorbemerkung`) | |
+| 9 | `Antwortdatum` | PDF header (`Ausgegeben:`) | ISO |
+| 10 | `Ministerium` | PDF pages 1-3 (`Der/Die Minister*in … hat die Kleine Anfrage`) | Free text; novelty logged |
 | 11 | `Systematik` | search hit | `; ` joined. Empty until enriched. |
 | 12 | `Schlagworte` | search hit | `; ` joined. Empty until enriched. |
 | 13 | `Link_Drucksache_Anfrage` | search hit | Direct PDF URL |
@@ -112,33 +115,27 @@ Buckets are 2000-wide partitions of the Drucksache number. `archive_lookup(N)` w
 - **Primary key:** `Drucksache_Antwort_Nr` (col 4). Always present once a row exists; matches the cache filename `MMD<wp>-<n>.pdf`.
 - `scan-archive` writes cols 1–10, 16, 17 (`pdf_local`), 18, 19. Sets status `pending_enrich`.
 - `crawl` writes cols 11–14 plus 19. Inserts new rows for unseen Drucksachen with cols 1–10 to be filled when `fetch-text` later pulls and PDF-extracts.
-- `fetch-text` writes cols 15–17 + 19. Triggers `scan-archive`-style page-1 extraction on freshly downloaded PDFs to backfill cols 1–10.
+- `fetch-text` writes cols 15–17 + 19. Triggers `scan-archive`-style page-1-to-3 extraction on freshly downloaded PDFs to backfill cols 1–10.
 - `Hinzugefuegt_am` set once, never updated.
 
-### 4.3 Vocab tables
+### 4.3 Vocabulary novelty log
 
-Three companion xlsx files validate the controlled-vocabulary fields (`Fraktion`, `Anfrager`, `Ministerium`) by comparing scraped values against canonical lists harvested from the search form's own dropdowns. Mismatches are logged, never auto-corrected — a divergent value might be a real new MP, not a typo.
+`data/vocab_novelty.log` is append-only, one line per unrecognised value:
 
-| File | Sheet | Columns |
-|---|---|---|
-| `data/fraktionen.xlsx` | `fraktionen` | `Wert`, `Aktualisiert_am` |
-| `data/ministerien.xlsx` | `ministerien` | `Wert`, `Aktualisiert_am` |
-| `data/abgeordnete.xlsx` | `abgeordnete` | `Wert`, `Aktualisiert_am` |
+```
+<ISO-timestamp> | <Drucksache_Antwort_Nr> | Fraktion | scraped="…"
+<ISO-timestamp> | <Drucksache_Antwort_Nr> | Ministerium | scraped="…"
+```
 
-`Wert` is the option's visible text exactly as it appears in the dropdown — assumed canonical.
-
-`data/vocab_mismatch.log` is append-only, one line per mismatch:
-`<ISO-timestamp> | <Drucksache_Antwort_Nr> | <Feld> | scraped="…" | nearest="…" (distance=N)`
-
-The "nearest" suggestion is computed by a Levenshtein helper inside `landtag.py`. Mismatches never block writes to `index.xlsx`.
+The Fraktion check uses the hardcoded set `{CDU, SPD, GRÜNE, FDP, AfD, fraktionslos}`. The Ministerium check compares against values already seen in `index.xlsx`; any first-time value gets a log line so the operator can review it. Novelty entries never block writes.
 
 ## 5. CLI surface
 
-Five verbs. All idempotent. Shared flags: `--rps` (default 1.0), `--user-agent` (default `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`), `--xlsx PATH` (default `data/index.xlsx`).
+Four verbs. All idempotent. Shared flags: `--rps` (default 1.0), `--user-agent` (default `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`), `--xlsx PATH` (default `data/index.xlsx`).
 
 ### `landtag scan-archive`
 
-Walk `Archiv/**/MMD<wp>-*.pdf`, run page-1 extraction, upsert rows. **No network.**
+Walk `Archiv/**/MMD<wp>-*.pdf`, run pages-1-to-3 extraction, upsert rows. **No network.**
 
 ```
 landtag scan-archive                         # everything in Archiv/
@@ -146,30 +143,45 @@ landtag scan-archive --wahlperiode 18
 landtag scan-archive --force                 # re-extract even if row exists
 ```
 
-Per-PDF: `pdftotext -layout -f 1 -l 1` → 8 anchored regexes (one each for cols 2,3,5,6,7,8,9,10; col 4 from filename; col 1 from path). Anything that doesn't match → row gets `Antworttext_Status='extract_failed'` and one line in `extract_errors.log`. Never raises.
+Per-PDF: `pdftotext -layout -f 1 -l 3` → 7 anchored regexes (cols 2,3,5,6,7,8,9,10; col 4 from filename; col 1 from path). Anything that doesn't match → row gets `Antworttext_Status='extract_failed'` and one line in `extract_errors.log`. Never raises.
 
 ### `landtag crawl`
 
 ```
 landtag crawl --wahlperiode 18
-landtag crawl --from 2024-01-01 --to 2024-12-31
-landtag crawl --wahlperiode 18 --rpp 100
+landtag crawl --wahlperiode 18 --from 2024-01-01 --to 2024-12-31
+landtag crawl --wahlperiode 18 --rpp 50
 landtag crawl --wahlperiode 18 --full
 ```
 
-Spring Webflow handshake (see §3.2). Two modes:
+Spring Webflow handshake (see §3.2). Three modes:
 
-- **Enrich mode (default):** for each row in `index.xlsx` with `Systematik`/`Schlagworte` empty, query the search by `Drucksache_Antwort_Nr` and parse the hit. Saves a full pagination sweep when `scan-archive` already populated rows.
+- **Enrich mode (default):** for each row in `index.xlsx` with `Systematik`/`Schlagworte` empty, POST a search with `nummer=<Drucksache_Antwort_Nr>` and parse the single hit. Cheapest path.
 - **Discovery mode (`--full`):** paginate the entire result set for the selector; insert any `Drucksache_Antwort_Nr` not already in the store with `Antworttext_Status='pending'`.
+- **Date filter (`--from`/`--to`):** applied client-side on `Anfragedatum` after fetch — the form has no date inputs.
 
-Validates `Fraktion`, `Anfrager`, `Ministerium` against vocab tables; mismatches → `vocab_mismatch.log` (never auto-corrected, never block the write). If a vocab file is missing or empty, one warning to stderr and validation is skipped for that field.
+Form fields posted (verified against the live form on 2026-05-01):
+
+| name | value |
+|---|---|
+| `_eventId_startanfragesearch` | `Suche starten` |
+| `keineSuche` | `false` |
+| `wp` | `18` (or `al` for all) |
+| `doktyp` | `KA` |
+| `nummer` | enrich mode: `<Drucksache_Antwort_Nr>`. discovery mode: empty |
+| `suchwort`, `autor`, `fraktion`, `schlagwort`, `region` | empty |
+| `rpp` | `50` |
+
+Tokens harvested from the form action URL: `webflowToken` and `webflowexecution…__searchr2020`. Cookies: `JSESSIONID`, `TS01a5776e`.
+
+Validates `Fraktion` against hardcoded set; `Ministerium` against values already in xlsx; novelty → `vocab_novelty.log` (never auto-corrected, never blocks the write).
 
 Step-by-step (discovery mode):
 
-1. GET search page; parse `webflowToken` + flow-execution parameter from the form action; pick up `JSESSIONID`.
-2. POST search with form fields `dokytyp=KleineAnfrage`, `wp=N`, optional date range, `rpp`, `_eventId_startanfragesearch=Suchen`, plus harvested tokens.
+1. GET `SEARCH_BASE`; parse the form action URL for the two flow tokens; pick up cookies.
+2. POST search with the form fields above + harvested tokens.
 3. Parse records, upsert into xlsx (file-locked, atomic).
-4. Follow next-page flow token until exhausted, with politeness (1 req/s baseline, exp backoff 1/2/4/8 s on 429/5xx, then fail).
+4. Follow next-page flow token until exhausted, with politeness (1 rps baseline, exp backoff 1/2/4/8 s on 429/5xx, then fail).
 
 ### `landtag fetch-text`
 
@@ -178,29 +190,17 @@ landtag fetch-text                           # all missing PDFs and/or .md files
 landtag fetch-text --wahlperiode 18 --limit 200
 landtag fetch-text --force                   # re-extract even if .md exists
 landtag fetch-text --workers 4               # parallel I/O, shared rps budget
+landtag fetch-text --rps 4                   # PDF dir is robots-allowed; can go faster
 ```
 
 For each candidate row:
 
 1. **Locate PDF.** Walk buckets for `MMD<wp>-<n>.pdf`. If present → `Antworttext_Quelle='pdf_local'`. Else GET `https://www.landtag.nrw.de/portal/WWW/dokumentenarchiv/Dokument/MMD<wp>-<n>.pdf` → write to correct bucket → `'downloaded'`. URL allow-list check (host + path regex `^/portal/WWW/dokumentenarchiv/Dokument/MMD\d+-\d+\.pdf$`) before any GET. 404 → `Antworttext_Status='no_answer_yet'`, skip.
-2. **Backfill page-1 metadata** if cols 2–10 are empty (i.e. row was created by `crawl --full` discovery). Same regexes as `scan-archive`.
+2. **Backfill page-1-to-3 metadata** if cols 2–10 are empty (i.e. row was created by `crawl --full` discovery). Same regexes as `scan-archive`.
 3. **Extract full text.** `pdfplumber` page-by-page joined by `\n\n`; `pypdf` fallback on parse error; both fail → `extract_failed`, log, no `.md` written.
 4. **Write `.md`** atomic temp+rename, update cols 15–17 + 19.
 
-`--workers N` parallelises only network + extraction; xlsx writes are batched. The 1-rps budget is shared across all workers.
-
-### `landtag refresh-vocab`
-
-```
-landtag refresh-vocab
-landtag refresh-vocab --only fraktionen,ministerien
-```
-
-Run the bootstrap GET to obtain a primed `httpx.Client`, parse the three `<select>` blocks (Fraktion, Abgeordneter, Ministerium) by `name=` attribute, write each into its vocab xlsx. Sorted, deduped, atomic write with file-lock; preserves prior `Aktualisiert_am` for unchanged rows; never deletes rows that vanished from the dropdown (kept for historical lookup; operator may prune).
-
-Console output: `Refreshed: F fraktionen (+a/-b), M ministerien (+a/-b), A abgeordnete (+a/-b)`. Exits non-zero only on HTTP/parse failure.
-
-Not auto-run by `crawl`. Operator workflow: `refresh-vocab` once per Wahlperiode (or whenever drift is suspected), then `crawl`, then `verify`.
+`--workers N` parallelises only network + extraction; xlsx writes are batched. The 1-rps default budget is shared across all workers; the operator may raise `--rps` for `fetch-text`-only runs since the PDF directory is robots-allowed.
 
 ### `landtag verify`
 
@@ -211,9 +211,9 @@ Read-only sanity checks. No network unless `--probe-site`. Reports:
 - Rows marked `extracted` whose `.md` is suspiciously short relative to the PDF page count.
 - Rows where `Kleine_Anfrage_Nr` or `Drucksache_*_Nr` look malformed.
 - Orphan files in `Archiv/` (PDFs/MDs without a matching xlsx row).
-- Vocab mismatch summary: total per field + top 10 unrecognised values per field.
+- Vocab novelty summary: count of unrecognised Fraktion / Ministerium values; top 10 each.
 
-Exits non-zero if any "broken" category is non-empty. The vocab mismatch summary is informational and never flips the exit code.
+Exits non-zero if any "broken" category is non-empty. The vocab novelty summary is informational and never flips the exit code.
 
 LLM-assisted modes (opt-in, off by default):
 
@@ -228,11 +228,11 @@ All model calls go through the [`llm`](https://pypi.org/project/llm/) PyPI libra
 
 - Default model: `llama3.1:8b` (override via `LANDTAG_LLM_MODEL`).
 - Switching to a cloud provider is a one-line config change because `llm` already normalises providers.
-- LLM calls only happen behind explicit `verify --llm-*` flags. `crawl`, `fetch-text`, `scan-archive`, `refresh-vocab` never call any model.
+- LLM calls only happen behind explicit `verify --llm-*` flags. `crawl`, `fetch-text`, `scan-archive` never call any model.
 
 ## 7. Politeness, errors, recovery
 
-- Default rate: 1 request per second across all HTTP traffic (search and PDF), as a single shared budget — `fetch-text --workers N` parallelises CPU-bound extraction but does not raise the network budget. Override with `--rps`.
+- Default rate: 1 request per second across all HTTP traffic, as a single shared budget. `fetch-text` may raise `--rps` (PDF dir is robots-allowed); `crawl` should not (search endpoint is robots-Disallow'd, see §1.1).
 - User-Agent: `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`.
 - Backoff on 429/5xx: exponential at 1, 2, 4, 8 seconds, then fail.
 - Atomic writes: every disk write that touches the xlsx, a `.md`, or a PDF goes through write-temp + `os.replace`.
@@ -251,7 +251,7 @@ The skill points at the verbs, not at curl recipes (the Webflow handshake is too
 
 - **When to use:** "Refreshing or querying Kleine Anfrage data from Landtag NRW."
 - **First-time setup:** `landtag scan-archive` (offline, fills the bulk).
-- **Refresh loop:** `landtag refresh-vocab` (rare) → `landtag crawl --wahlperiode 18` → `landtag fetch-text` → `landtag verify`.
+- **Refresh loop:** `landtag crawl --wahlperiode 18` → `landtag fetch-text` → `landtag verify`.
 - **Read access:** `data/index.xlsx` for filtering/aggregation; `Archiv/.../MMD18-N.md` for quoting.
 - **Don't:** run two verbs concurrently against the same xlsx; hand-edit cols 15–17.
 
@@ -260,6 +260,7 @@ The skill points at the verbs, not at curl recipes (the Webflow handshake is too
 ```
 wdr-kleineanfrage/
 ├── CLAUDE.md
+├── README.md
 ├── landtag.py                        ← all logic, ~300 lines
 ├── requirements.txt                  ← httpx, beautifulsoup4, openpyxl,
 │                                       pdfplumber, pypdf, filelock, llm
@@ -272,10 +273,22 @@ wdr-kleineanfrage/
 
 Dependencies live in `requirements.txt`, not `pyproject.toml`. No `src/` tree, no test infra, no lint/type toolchain pinned up front.
 
-## 11. Open items deferred
+## 11. Verified-against-live-site notes (2026-05-01)
+
+These are the empirical facts the design rests on; they were checked against the live page and a 30-PDF sample on 2026-05-01.
+
+- **Regex anchors** (in `landtag.py`) match at 100% on a 30-PDF random WP18 sample when applied to `pdftotext -layout -f 1 -l 3`. Page count of 3 (not 1) is required.
+- **Form fields** of the search are exactly: `wp`, `doktyp`, `suchwort`, `nummer`, `autor`, `fraktion`, `schlagwort`, `region`, `rpp`, `keineSuche`, `_eventId_startanfragesearch`. No date fields. `autor` is server-side empty (JS-populated).
+- **doktyp value for Kleine Anfrage** is `KA` (not `KleineAnfrage`).
+- **Webflow tokens** live in the form `action` URL: `?webflowToken=<UUID>&webflowexecution<random>__searchr2020=<value>`.
+- **Cookies** to retain on the client: `JSESSIONID`, `TS01a5776e`.
+- **robots.txt** Disallows the search path; PDF directory for WP18 is allowed (see §1.1).
+
+## 12. Open items deferred
 
 - Front-matter in `.md` files (Anfragenummer, page markers).
 - Große / Mündliche Anfrage.
 - Cross-Wahlperiode aggregations as a verb.
 - Per-MP detail-page enrichment for Abgeordnete.
 - Test scaffolding (added if/when regexes break in practice).
+- Scraping the JS-populated `autor` dropdown (would require rodney or hitting an undocumented Ajax endpoint).

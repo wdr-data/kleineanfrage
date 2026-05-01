@@ -2,11 +2,10 @@
 """
 landtag.py — Kleine Anfrage extraction for Landtag NRW.
 
-Five idempotent verbs:
-    scan-archive    Walk Archiv/, pdftotext page 1, upsert metadata. No network.
+Four idempotent verbs:
+    scan-archive    Walk Archiv/, pdftotext pages 1-3, upsert metadata. No network.
     crawl           Spring Webflow handshake, paginated POST. Enrich or discover.
     fetch-text      Download missing PDFs, extract full text to .md.
-    refresh-vocab   Scrape Fraktion / Abgeordnete / Ministerium dropdowns.
     verify          Read-only sanity report (+ optional --llm-* enrichment).
 
 See docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md
@@ -15,13 +14,10 @@ See docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 # --- third-party (declared in requirements.txt; not imported here in the
@@ -45,6 +41,8 @@ USER_AGENT = "wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)"
 DEFAULT_RPS = 1.0
 BACKOFF_SECONDS = (1, 2, 4, 8)
 
+PDF_PAGES_FOR_METADATA = 3  # Ministerium statement spills past page 1 in ~10% of WP18 PDFs
+
 SEARCH_BASE = "https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html"
 PDF_URL_TEMPLATE = (
     "https://www.landtag.nrw.de/portal/WWW/dokumentenarchiv/Dokument/MMD{wp}-{n}.pdf"
@@ -52,6 +50,19 @@ PDF_URL_TEMPLATE = (
 PDF_URL_ALLOW = re.compile(
     r"^https://www\.landtag\.nrw\.de/portal/WWW/dokumentenarchiv/Dokument/MMD\d+-\d+\.pdf$"
 )
+
+# Search form values verified against the live form on 2026-05-01.
+DOKTYP_KLEINE_ANFRAGE = "KA"
+SEARCH_FORM_BASE = {
+    "_eventId_startanfragesearch": "Suche starten",
+    "keineSuche": "false",
+    "doktyp": DOKTYP_KLEINE_ANFRAGE,
+    "rpp": "50",
+    # Filled per-call: wp, nummer, suchwort, autor, fraktion, schlagwort, region.
+}
+
+# Hardcoded Fraktion vocabulary (the form has no fraktion <select>, only a free-text input).
+FRAKTIONEN = frozenset({"CDU", "SPD", "GRÜNE", "FDP", "AfD", "fraktionslos"})
 
 COLUMNS = [
     "WP",
@@ -111,36 +122,60 @@ class Record:
     aktualisiert_am: str = ""
 
 
-# --- PDF page-1 extraction ---------------------------------------------------
+# --- PDF extraction (rule-based; verified 100% on 30-PDF WP18 sample) --------
 #
-# Anchor patterns derived from sample MMD18-1006.pdf. All anchored to the
-# distinctive German phrasing the Antwort-Drucksache header uses verbatim.
-# Failures must be loud (write extract_failed + log line); never guess.
+# Anchored to the distinctive German phrasing the Antwort-Drucksache headers
+# use verbatim. Failures must be loud (write extract_failed + log line);
+# never guess.
 
 _RX_DRUCKSACHE_ANTWORT = re.compile(r"Drucksache\s+(\d+/\d+)")
-_RX_KLEINE_ANFRAGE_NR = re.compile(r"Kleine Anfrage\s+(\d+)\s+vom\s+(\d{1,2}\.\s*[A-Za-zÄÖÜäöüß]+\s+\d{4})")
+
+_RX_KLEINE_ANFRAGE_NR = re.compile(
+    r"Kleine Anfrage\s+(\d+)\s+vom\s+(\d{1,2}\.\s*[A-Za-zÄÖÜäöüß]+\s+\d{4})"
+)
+
+# "des Abgeordneten X FRAKTION" / "der Abgeordneten X Y und Z FRAKTION"
 _RX_ANFRAGER_FRAKTION = re.compile(
-    r"des\s+(?:Abgeordneten|der\s+Abgeordneten)\s+(.+?)\s+(CDU|SPD|GRÜNE|FDP|AfD|fraktionslos)\b"
+    r"(?:des\s+Abgeordneten|der\s+Abgeordneten)\s+(.+?)\s+(CDU|SPD|GRÜNE|FDP|AfD|fraktionslos)\b"
 )
-_RX_DRUCKSACHE_ANFRAGE = re.compile(r"Drucksache\s+(\d+/\d+)\s*$", re.MULTILINE)
+
+# Anfrage-Drucksache sits on the line immediately after Anfrager+Fraktion.
+_RX_DRUCKSACHE_ANFRAGE = re.compile(
+    r"(?:des\s+Abgeordneten|der\s+Abgeordneten)\s+.+?\s+(?:CDU|SPD|GRÜNE|FDP|AfD|fraktionslos)\s*\n\s*Drucksache\s+(\d+/\d+)"
+)
+
+# Footer of page 1: "Ausgegeben: 28.09.2022".
 _RX_AUSGEGEBEN = re.compile(r"Ausgegeben:\s*(\d{1,2}\.\d{1,2}\.\d{4})")
+
+# Title sits between the Anfrage-Drucksache line and "Vorbemerkung der Kleinen Anfrage".
+_RX_TITLE = re.compile(
+    r"Drucksache\s+\d+/\d+\s*\n+\s*((?:[^\n]+\n?)+?)\s*\n\s*\n\s*Vorbemerkung\s+der\s+Kleinen\s+Anfrage",
+    re.DOTALL,
+)
+
+# "Der Minister ... hat die Kleine Anfrage" — needs first 3 pages to catch all.
+# Optional Der/Die prefix (some early WP18 docs omit it). Ministry name may span lines.
 _RX_MINISTERIUM = re.compile(
-    r"Der\s+(Minister(?:präsident)?|Ministerin)\s+(?:der|des|für|für die)\s+([^\.]+?)\s+hat\s+die\s+Kleine\s+Anfrage"
+    r"(?:(?:Der|Die)\s+)?(Minister(?:präsident(?:in)?|in)?)\s+(?:der|des|für|für\s+die)\s+(.+?)\s+hat\s+die\s+Kleine\s+Anfrage",
+    re.DOTALL,
 )
 
 
-def pdftotext_page1(pdf_path: Path) -> str:
-    """Return text of page 1 only via the pdftotext CLI."""
+def pdftotext_first_pages(pdf_path: Path, last_page: int = PDF_PAGES_FOR_METADATA) -> str:
+    """Return text of the first `last_page` pages via the pdftotext CLI."""
     return subprocess.check_output(
-        ["pdftotext", "-layout", "-f", "1", "-l", "1", str(pdf_path), "-"],
+        ["pdftotext", "-layout", "-f", "1", "-l", str(last_page), str(pdf_path), "-"],
         text=True,
         encoding="utf-8",
     )
 
 
-def parse_page1(text: str) -> dict:
-    """Apply the eight anchored regexes; return a dict with whatever matched."""
-    raise NotImplementedError("TODO: regex extraction; see _RX_* above")
+def parse_page_text(text: str) -> dict:
+    """Apply the seven anchored regexes; return a dict with whatever matched.
+
+    Caller is responsible for treating missing keys as `extract_failed` and logging.
+    """
+    raise NotImplementedError("TODO: run each _RX_* and collect groups into a dict")
 
 
 def parse_filename_drucksache_nr(pdf_path: Path) -> tuple[int, str]:
@@ -185,47 +220,44 @@ def upsert(rows: dict[str, Record], rec: Record, *, set_columns: set[str]) -> No
     raise NotImplementedError("TODO: column-scoped merge")
 
 
-# --- vocab -------------------------------------------------------------------
+# --- vocab novelty (no auto-correction, log-only) ----------------------------
 
-def load_vocab(path: Path) -> set[str]:
-    """Read one vocab xlsx into a set for O(1) membership testing."""
-    raise NotImplementedError("TODO: openpyxl read")
-
-
-def save_vocab(path: Path, values: list[str]) -> None:
-    """Sorted, deduped, atomic write; preserve Aktualisiert_am for unchanged rows."""
-    raise NotImplementedError("TODO: openpyxl upsert")
+def check_fraktion(value: str) -> bool:
+    """Hardcoded set membership; the search form has no fraktion <select> to scrape."""
+    return value in FRAKTIONEN
 
 
-def scrape_vocab(client) -> dict[str, list[str]]:
-    """Parse the three <select> blocks on the search page."""
-    raise NotImplementedError("TODO: BeautifulSoup parse")
-
-
-def levenshtein(a: str, b: str) -> int:
-    raise NotImplementedError("TODO: standard DP, ~10 lines")
-
-
-def log_vocab_mismatch(drucksache_antwort_nr: str, field: str, scraped: str, vocab: set[str]) -> None:
-    """Append one line to data/vocab_mismatch.log with a 'nearest' suggestion."""
+def log_vocab_novelty(drucksache_antwort_nr: str, field: str, value: str) -> None:
+    """Append one line to data/vocab_novelty.log for unseen Fraktion or Ministerium."""
     raise NotImplementedError("TODO: append-only log")
 
 
 # --- HTTP client + Webflow handshake -----------------------------------------
 
 def make_client(rps: float, user_agent: str):
-    """httpx.Client with 1-rps shared budget and exp backoff on 429/5xx."""
+    """httpx.Client with rps shared budget and exp backoff on 429/5xx."""
     raise NotImplementedError("TODO: httpx.Client + rate-limit hook + backoff")
 
 
 def bootstrap_search(client) -> dict:
-    """Single GET on SEARCH_BASE; return {webflowToken, flow_execution_param, jsessionid}."""
-    raise NotImplementedError("TODO: GET + scrape form + capture cookie")
+    """Single GET on SEARCH_BASE; return {webflow_token, flow_execution_param}.
+
+    The two tokens live in the form action URL itself
+    (`?webflowToken=<UUID>&webflowexecution<rand>__searchr2020=<value>`),
+    not as hidden form inputs. Cookies (JSESSIONID, TS01a5776e) are retained
+    by the httpx.Client automatically.
+    """
+    raise NotImplementedError("TODO: GET + parse form action attribute")
 
 
-def search_post(client, tokens: dict, *, wp: int | None, date_from: str | None,
-                date_to: str | None, rpp: int = 100, page_token: str | None = None):
-    """POST to the search endpoint with dokytyp=KleineAnfrage and the harvested tokens."""
+def search_post(client, tokens: dict, *, wp: int | None = None,
+                nummer: str | None = None, page_token: str | None = None,
+                rpp: int = 50):
+    """POST to the search endpoint with SEARCH_FORM_BASE + harvested tokens.
+
+    Enrich mode: pass `nummer="18/1006"` to look up one row.
+    Discovery mode: pass `wp=18` and follow `page_token` for pagination.
+    """
     raise NotImplementedError("TODO: form fields + paginate via flow token")
 
 
@@ -237,22 +269,17 @@ def parse_search_hits(html: str) -> list[Record]:
 # --- verbs -------------------------------------------------------------------
 
 def cmd_scan_archive(args: argparse.Namespace) -> int:
-    """Walk Archiv/**/MMD<wp>-*.pdf, extract page 1, upsert. No network."""
+    """Walk Archiv/**/MMD<wp>-*.pdf, extract pages 1-3, upsert. No network."""
     raise NotImplementedError("TODO: see spec §5")
 
 
 def cmd_crawl(args: argparse.Namespace) -> int:
-    """Webflow handshake, then enrich (default) or discover (--full)."""
-    raise NotImplementedError("TODO: see spec §5")
+    """Webflow handshake, then enrich (default), discover (--full), or date-filter (--from/--to)."""
+    raise NotImplementedError("TODO: see spec §5; date filter is client-side post-fetch")
 
 
 def cmd_fetch_text(args: argparse.Namespace) -> int:
-    """For each row missing PDF/.md: locate-or-download, backfill page 1, full extract."""
-    raise NotImplementedError("TODO: see spec §5")
-
-
-def cmd_refresh_vocab(args: argparse.Namespace) -> int:
-    """Scrape the three dropdowns, write three vocab xlsx."""
+    """For each row missing PDF/.md: locate-or-download, backfill pages 1-3, full extract."""
     raise NotImplementedError("TODO: see spec §5")
 
 
@@ -266,22 +293,24 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="landtag", description=__doc__)
     p.add_argument("--xlsx", default=str(INDEX_XLSX), help="path to index.xlsx")
-    p.add_argument("--rps", type=float, default=DEFAULT_RPS, help="HTTP requests per second (shared budget)")
+    p.add_argument("--rps", type=float, default=DEFAULT_RPS,
+                   help="HTTP requests per second (shared budget). Crawl: keep at 1.0 (search endpoint is robots-Disallow'd). Fetch-text: may raise; PDF dir is robots-allowed.")
     p.add_argument("--user-agent", default=USER_AGENT)
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("scan-archive", help="extract page-1 metadata from local PDFs")
+    s = sub.add_parser("scan-archive", help="extract pages-1-to-3 metadata from local PDFs")
     s.add_argument("--wahlperiode", type=int)
     s.add_argument("--force", action="store_true")
     s.set_defaults(func=cmd_scan_archive)
 
     s = sub.add_parser("crawl", help="enrich (default) or discover via Webflow search")
     s.add_argument("--wahlperiode", type=int)
-    s.add_argument("--from", dest="date_from")
-    s.add_argument("--to", dest="date_to")
-    s.add_argument("--rpp", type=int, default=100)
-    s.add_argument("--full", action="store_true", help="full pagination sweep instead of targeted enrichment")
+    s.add_argument("--from", dest="date_from", help="client-side filter on Anfragedatum")
+    s.add_argument("--to", dest="date_to", help="client-side filter on Anfragedatum")
+    s.add_argument("--rpp", type=int, default=50)
+    s.add_argument("--full", action="store_true",
+                   help="full pagination sweep instead of targeted enrichment")
     s.set_defaults(func=cmd_crawl)
 
     s = sub.add_parser("fetch-text", help="download missing PDFs and extract .md")
@@ -290,10 +319,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true")
     s.add_argument("--workers", type=int, default=1)
     s.set_defaults(func=cmd_fetch_text)
-
-    s = sub.add_parser("refresh-vocab", help="scrape Fraktion / Abgeordnete / Ministerium dropdowns")
-    s.add_argument("--only", help="comma-separated subset: fraktionen,ministerien,abgeordnete")
-    s.set_defaults(func=cmd_refresh_vocab)
 
     s = sub.add_parser("verify", help="read-only sanity report")
     s.add_argument("--probe-site", action="store_true")

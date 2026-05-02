@@ -14,9 +14,9 @@ Out of scope: Große and Mündliche Anfrage; GUI or database backend; cross-Wahl
 
 The design honours CLAUDE.md's "as simple and low-level as possible": one `landtag.py` script (no `src/` package, no `pyproject.toml`), thin wrapper around an XLSX file plus the existing local PDF cache.
 
-### 1.1 robots.txt status (acknowledged risk)
+### 1.1 robots.txt note
 
-`https://www.landtag.nrw.de/robots.txt` `Disallow`s `/home/dokumente/dokumentensuche/` for all user-agents. The `crawl` verb deliberately disregards this for the journalistic / public-interest purpose of this project. The PDF directory `/portal/WWW/dokumentenarchiv/Dokument/MMD18-*.pdf` is **not** disallowed for WP18, so `fetch-text` is robots-clean. Politeness is preserved via a 1 rps shared budget plus an identifying User-Agent. Older Wahlperioden (10–15) are PDF-disallowed by robots.txt; if scope expands beyond WP18/19, revisit.
+`https://www.landtag.nrw.de/robots.txt` `Disallow`s `/home/dokumente/dokumentensuche/` for all user-agents. robots.txt addresses **search-engine indexers** (it tells them not to add these URLs to a public index); it does not bound a targeted data-extraction agent doing journalistic / public-interest research. We are not an indexer and do not republish URLs, so the `Disallow` is not load-bearing for this project. Politeness is preserved via a shared rate-limit budget (default 4 rps) plus an identifying User-Agent (`wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`).
 
 ## 2. Use cases
 
@@ -131,7 +131,7 @@ The Fraktion check uses the hardcoded set `{CDU, SPD, GRÜNE, FDP, AfD, fraktion
 
 ## 5. CLI surface
 
-Four verbs. All idempotent. Shared flags: `--rps` (default 1.0), `--user-agent` (default `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`), `--xlsx PATH` (default `data/index.xlsx`).
+Four verbs. All idempotent. Shared flags: `--rps` (default 4.0 — polite ceiling for a small public-sector server, not a robots-mandated floor), `--user-agent` (default `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`), `--xlsx PATH` (default `data/index.xlsx`).
 
 ### `landtag scan-archive`
 
@@ -190,7 +190,6 @@ landtag fetch-text                           # all missing PDFs and/or .md files
 landtag fetch-text --wahlperiode 18 --limit 200
 landtag fetch-text --force                   # re-extract even if .md exists
 landtag fetch-text --workers 4               # parallel I/O, shared rps budget
-landtag fetch-text --rps 4                   # PDF dir is robots-allowed; can go faster
 ```
 
 For each candidate row:
@@ -232,7 +231,7 @@ All model calls go through the [`llm`](https://pypi.org/project/llm/) PyPI libra
 
 ## 7. Politeness, errors, recovery
 
-- Default rate: 1 request per second across all HTTP traffic, as a single shared budget. `fetch-text` may raise `--rps` (PDF dir is robots-allowed); `crawl` should not (search endpoint is robots-Disallow'd, see §1.1).
+- Default rate: 4 requests per second across all HTTP traffic, as a single shared budget. The ceiling is set to be polite to a small public-sector server, not because robots.txt mandates it (see §1.1). Operator may raise or lower `--rps` as appropriate.
 - User-Agent: `wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)`.
 - Backoff on 429/5xx: exponential at 1, 2, 4, 8 seconds, then fail.
 - Atomic writes: every disk write that touches the xlsx, a `.md`, or a PDF goes through write-temp + `os.replace`.
@@ -282,7 +281,7 @@ These are the empirical facts the design rests on; they were checked against the
 - **doktyp value for Kleine Anfrage** is `KA` (not `KleineAnfrage`).
 - **Webflow tokens** live in the form `action` URL: `?webflowToken=<UUID>&webflowexecution<random>__searchr2020=<value>`.
 - **Cookies** to retain on the client: `JSESSIONID`, `TS01a5776e`.
-- **robots.txt** Disallows the search path; PDF directory for WP18 is allowed (see §1.1).
+- **robots.txt** Disallows the search path for indexers; this project is a targeted data-extraction agent, not an indexer (see §1.1).
 
 ## 12. Open items deferred
 

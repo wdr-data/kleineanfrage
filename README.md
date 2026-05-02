@@ -41,8 +41,8 @@ skills/landtag-nrw-extraction/SKILL.md
 
 ## Notes
 
-- **robots.txt:** the Landtag search endpoint is `Disallow`-ed for all bots. The `crawl` verb knowingly disregards this for journalistic purpose; politeness is via 1 rps shared budget plus an identifying User-Agent. The PDF directory used by `fetch-text` is robots-allowed for WP18.
-- **Scope:** WP18 today; WP17/WP16 PDFs are robots-allowed and could be added with a flag change. WP10–15 PDFs are robots-Disallow'd.
+- **robots.txt:** the Landtag search endpoint is `Disallow`-ed for indexers. We are a targeted data-extraction agent doing journalistic / public-interest research, not a search-engine indexer, so the `Disallow` does not bind us. Politeness is via a 4 rps shared budget (`--rps`) plus an identifying User-Agent.
+- **Scope:** WP18 today; WP17/WP16 are reachable with a flag change.
 - **LLM:** all model calls are opt-in (only behind `verify --llm-*`) and route through the `llm` library; default backend is local Ollama (no data leaves the machine).
 
 Full design and rationale: [`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`](docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md).

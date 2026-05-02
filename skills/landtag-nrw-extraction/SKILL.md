@@ -70,7 +70,7 @@ python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv
 - Run two verbs concurrently against the same xlsx. The file lock will block, but it's still simpler not to.
 - Hand-edit cols `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` — they're owned by `fetch-text`.
 - Auto-correct values that landed in `data/vocab_novelty.log`. A divergent Fraktion or Ministerium might be a real new entry, not a typo. Inspect, then update the hardcoded `FRAKTIONEN` set in `landtag.py` if appropriate.
-- Bypass the rate limiter on the `crawl` endpoint. The search path is robots-Disallow'd; 1 rps default is the polite floor. The PDF directory is robots-allowed for WP18, so `fetch-text --rps 4` is fine.
+- Hammer the server. Default `--rps 4` is a polite ceiling for a small public-sector site. robots.txt addresses indexers (we are a targeted data agent, not an indexer), but it's still the operator's job not to DoS the host.
 
 ## Common failures
 

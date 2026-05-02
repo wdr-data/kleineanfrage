@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Read these first
+
+- **`HANDOVER.md`** — current state, what's tested vs untested, OneDrive performance gotcha, recommended next steps. Read this before doing anything else.
+- **`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`** — full design spec.
+- **`skills/landtag-nrw-extraction/SKILL.md`** — operator-facing recipe for the four CLI verbs.
+
 ## Project context
 
 Objective is to get data from the public parliamentary database of Landtag Nordrhein-Westfalen via this URL: https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html

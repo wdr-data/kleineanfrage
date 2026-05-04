@@ -18,3 +18,5 @@ venv/
 # editors
 .vscode/
 .idea/
+.Rproj.user
+.positai

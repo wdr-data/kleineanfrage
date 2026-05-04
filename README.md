@@ -1,48 +1,153 @@
 # wdr-kleineanfrage
 
-Extract structured data on **Kleine Anfragen** (parliamentary inquiries) from the Landtag NRW into a local Excel store, with answer texts persisted as Markdown alongside the source PDFs.
+Strukturierte Daten zu **Kleinen Anfragen** des Landtags Nordrhein-Westfalen lokal extrahieren — Metadaten in einer Excel-Datei, Antworttexte als Markdown neben den Original-PDFs.
 
-Built for journalistic / public-interest research at WDR. Wraps a single `landtag.py` script around an XLSX file and a local PDF cache (`Archiv/`); no database, no package scaffolding.
+Entwickelt für journalistische Recherche im WDR. Eine einzelne `landtag.py` umschließt eine XLSX-Datei und einen lokalen PDF-Cache (`Archiv/`); keine Datenbank, kein Paket-Setup.
 
-## Quick start
+---
+
+## Was hier drin ist
+
+```
+landtag.py                                   ← die gesamte Logik (eine Datei, ~750 Zeilen)
+requirements.txt
+Archiv/                                      ← PDF-Cache (~18.000 Dateien, gitignored)
+data/index.xlsx                              ← eine Zeile pro Kleiner Anfrage
+data/*.log                                   ← Extraktions-/Crawl-Fehler, Vokabel-Neulinge
+docs/superpowers/specs/2026-05-01-…design.md ← vollständiger Entwurf
+skills/landtag-nrw-extraction/SKILL.md       ← Skill-Definition für Agenten
+HANDOVER.md                                  ← aktueller Stand, getestet vs. ungetestet
+CLAUDE.md                                    ← Agenten-Briefing
+```
+
+---
+
+## Einmaliges Setup
 
 ```sh
 pip install -r requirements.txt
-brew install poppler                              # provides pdftotext
-python landtag.py scan-archive --wahlperiode 18   # offline; fills index.xlsx from Archiv/
-python landtag.py crawl --wahlperiode 18          # enrich Systematik / Schlagworte / links
-python landtag.py fetch-text --wahlperiode 18     # download missing PDFs, extract .md
-python landtag.py verify                          # sanity report
+brew install poppler          # liefert pdftotext (auf macOS)
 ```
 
-After the first run, `data/index.xlsx` has one row per Kleine Anfrage; `Archiv/.../MMD18-N.md` holds the extracted answer text for each.
+**Wichtig vor dem ersten Lauf:** `Archiv/` liegt in einem OneDrive-synchronisierten Ordner. OneDrive-On-Demand macht `pdftotext`-Zugriffe extrem langsam (Faktor 1000×). Eine der beiden Optionen wählen:
 
-## Verbs
+1. In der OneDrive-UI `Archiv/` als „Immer auf diesem Gerät verfügbar" markieren.
+2. `cp -r Archiv /tmp/wdr-archive` und dort arbeiten.
 
-| Verb | What it does |
-|---|---|
-| `scan-archive` | Walk `Archiv/`, `pdftotext` pages 1–3, extract metadata via 7 anchored regexes. No network. |
-| `crawl` | Spring Webflow handshake against the search page. Default mode enriches by Drucksache-Nr; `--full` paginates the entire Wahlperiode for discovery. |
-| `fetch-text` | Download PDFs (skipping anything in `Archiv/`), `pdfplumber` extraction to `.md`. |
-| `verify` | Read-only sanity report; optional LLM-backed plausibility / rescue checks. |
+Ohne diesen Schritt: `scan-archive` nur mit `--limit` ausführen.
 
-All verbs are idempotent and share `data/index.xlsx` via a file lock.
+---
 
-## Layout
+## Die Verben
 
+Alle Verben sind **idempotent** und teilen sich `data/index.xlsx` über einen File-Lock. Die Online-Suche (`crawl`) ist Canon — sie bestimmt, welche KAs der Wahlperiode existieren. `scan-archive` und `fetch-text` reichern den so aufgebauten Index an.
+
+| # | Verb | Was es tut | Netz? |
+|---|---|---|---|
+| 1 | `crawl` | Spring-Webflow-Handshake gegen die Suchseite; paginiert die ganze Wahlperiode. Liefert Zeilen mit KA-Nr, Anfrager, Fraktion, beide Drucksachen + Daten, Ministeriums-Kürzel, Systematik, Schlagworte, Titel. **Canon für alle Felder, die der Such-Treffer enthält.** | ja |
+| 2 | `fetch-text` | Lädt fehlende Antwort-PDFs herunter (überspringt alles im `Archiv/`) und extrahiert den Volltext mit `pdfplumber` nach `.md`. Skipt zurückgezogene und unbeantwortete KAs. | ja |
+| 3 | `scan-archive` | Reichert vorhandene Index-Zeilen aus den lokalen Antwort-PDFs an (Anfragetitel, Ministerium-Prosaname). Filtert dabei Anfrage-PDFs und Große-Anfragen-Antworten heraus. **Default-Modus = enrich-only**: schreibt nie über Crawl-Werte. `--allow-discovery` resurrektiert das alte Verhalten (ohne Crawl). | nein |
+| 4 | `normalize` | Matcht `Fraktion` / `Ministerium` gegen `Index/*.xlsx`, füllt `*_Canonical` und `Ministerium_Kuerzel`. Wird auch automatisch am Ende von `crawl` und `fetch-text` aufgerufen. | nein |
+| 5 | `resolve` | Gezielte Re-Suche für eine oder mehrere KA-Nrn (z. B. nach Verdachtsfällen aus `verify`). `--counter-search` macht eine Gegensuche mit `doktyp=GA` (Große Anfrage), `--delete-phantom` löscht stale Zeilen mit anderer Antwort-Drucksache. | ja |
+| 6 | `extract-multi-ministerium` | Parst pro Antwort-`.md` den Boundary-Absatz „Der Minister … hat die Kleine Anfrage … beantwortet." und schreibt das vollständige Set beteiligter Ressorts (federführend zuerst) nach `Beteiligte_Ministerien_Kuerzel`. Idempotent. WP18 abgedeckt; WP17 hat anderen Ministeriumszuschnitt → out of scope. | nein |
+| 7 | `verify` | Read-only Sanity-Report: Status-Zählungen, KA-Nr-Lücken pro WP, md ↔ KA-Nr-Konsistenzcheck, Duplikat-KA-Nrn, Waisen-PDFs. Optional LLM-Plausibilität via `--llm-*`. | nein |
+
+### Standardlauf
+
+```sh
+python landtag.py crawl                       --wahlperiode 18  # ~25 min bei --rps 4
+python landtag.py fetch-text                  --wahlperiode 18  # nur fehlende PDFs (~5 min)
+python landtag.py scan-archive                --wahlperiode 18  # ~10 min, Min/Titel anreichern
+python landtag.py extract-multi-ministerium                     # Beteiligte Ressorts pro Antwort
+python landtag.py verify
 ```
-landtag.py                 ← all logic, ~300 lines
-requirements.txt
-Archiv/                    ← PDF cache (~18,000 files; gitignored)
-data/                      ← index.xlsx + logs (gitignored)
-docs/superpowers/specs/    ← design spec
-skills/landtag-nrw-extraction/SKILL.md
+
+Ein zweites Wahlperiode-Set (z. B. WP17) wird mit denselben Verben in den gleichen Index gemerged; jede Zeile trägt ihre `WP`-Spalte.
+
+### Datumsfilter (clientseitig nach Fetch)
+
+```sh
+python landtag.py crawl --wahlperiode 18 --from 2024-01-01 --to 2024-12-31
 ```
 
-## Notes
+### Verdachtsfälle reparieren
 
-- **robots.txt:** the Landtag search endpoint is `Disallow`-ed for indexers. We are a targeted data-extraction agent doing journalistic / public-interest research, not a search-engine indexer, so the `Disallow` does not bind us. Politeness is via a 4 rps shared budget (`--rps`) plus an identifying User-Agent.
-- **Scope:** WP18 today; WP17/WP16 are reachable with a flag change.
-- **LLM:** all model calls are opt-in (only behind `verify --llm-*`) and route through the `llm` library; default backend is local Ollama (no data leaves the machine).
+```sh
+# md ↔ KA-Nr-Mismatch oder ein Loch in der KA-Nummerierung — gezielt nachfragen:
+python landtag.py resolve --ka 144 --ka 3167 --counter-search --delete-phantom
+```
 
-Full design and rationale: [`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`](docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md).
+---
+
+## Nutzung in Claude Code / anderen Agenten
+
+### Wann dieses Tool greifen sollte
+
+- Frage zu **Wer/Was/Wann** einer Kleinen Anfrage (Anfrager, Fraktion, Datum, Ministerium, Schlagworte) → **`data/index.xlsx`** abfragen.
+- Frage zum **Inhalt einer konkreten Antwort** → **`Archiv/.../MMD18-N.md`** lesen. Nur auf die PDF zurückfallen, wenn die `.md` fehlt.
+- **Quantitative Auswertung** über den Datenbestand (z. B. „welche Abgeordneten stellen die meisten KAs", „durchschnittliche Antwortdauer") → mit pandas auf der XLSX arbeiten.
+- Wunsch nach **frischen Daten** → den Refresh-Loop oben anstoßen (vorher User informieren, dass `crawl` ~1 h läuft).
+
+### Lesen mit pandas
+
+```python
+import pandas as pd
+df = pd.read_excel("data/index.xlsx")
+
+df[df.Fraktion == "AfD"]                                # nach Fraktion
+df[df.Anfrager.str.contains("Wagner", na=False)]        # nach Abgeordnete:r
+df[df.Schlagworte.str.contains("Polizei", na=False)]   # nach Schlagwort
+df[df.Anfragedatum >= "2024-01-01"]                     # nach Datum
+df[df.Ministerium_Kuerzel == "JM"]                      # nach federführendem Ressort
+df[df.Beteiligte_Ministerien_Kuerzel.fillna("").str.contains("IM")]   # nach beteiligtem Ressort (auch nicht-federführend)
+```
+
+`Ministerium_Kuerzel` = federführendes Ressort aus dem Search-Hit.
+`Beteiligte_Ministerien_Kuerzel` = comma-separierte Kürzel-Liste **aller** im Boundary-Absatz genannten Ressorts (federführend zuerst), gefüllt von `extract-multi-ministerium`.
+
+Antworttext einer Zeile holen:
+
+```python
+md_path = df.loc[df.Drucksache_Antwort_Nr == "18/1006", "Antworttext"].iloc[0]
+print(open(md_path, encoding="utf-8").read())
+```
+
+CSV-Export, falls ein externes Tool das braucht:
+
+```sh
+python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv', index=False)"
+```
+
+### Was Agenten **nicht** tun sollen
+
+- **Nicht zwei Verben gleichzeitig** auf derselben XLSX laufen lassen. Der Lock blockt zwar, aber sauberer ist es trotzdem nicht.
+- **Spalten `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` nicht von Hand editieren** — sie gehören `fetch-text`.
+- **Werte aus `data/vocab_novelty.log` nicht automatisch korrigieren.** Eine ungewohnte Fraktion oder ein ungewohntes Ministerium kann ein echter neuer Eintrag sein (Kabinettsumbildung, neuer Abgeordneter). Erst prüfen, dann ggf. die hartkodierten `FRAKTIONEN`/`MINISTERIEN`-Sets in `landtag.py` ergänzen.
+- **Server nicht hämmern.** `--rps 4` ist die voreingestellte höfliche Obergrenze. Höher nur mit gutem Grund.
+- **Bei `crawl`-Fehlern nicht blind retryen.** Spring-Webflow-Tokens sind single-use; das Re-Bootstrap pro Query ist bereits eingebaut. Wenn `crawl` 0 Hits liefert, hat sich vermutlich der HTML-Parser-Anker verschoben — `bootstrap_search` in `landtag.py` prüfen.
+
+---
+
+## Bekannte Stolperfallen
+
+- **`pdftotext: not found`** → `brew install poppler` (macOS) bzw. distro-Äquivalent.
+- **`pdftotext` schluckt das D in „AfD"** → ca. 3 % der WP18-PDFs landen mit `Fraktion='Af'` in `vocab_novelty.log`. Patch wäre, die Fraktions-Alternation auf `(CDU|SPD|GRÜNE|FDP|AfD|Af|fraktionslos)` zu erweitern und `Af` → `AfD` zu normalisieren.
+- **`pdftotext` schluckt Leerzeichen** zwischen KA-Nr und „vom" → Pattern wie `Kleine Anfrage 6790 vom` wird als „6790**1**vom" bzw. „67901vom" extrahiert. Index pflegt deshalb die KA-Nr aus dem `crawl`-Treffer (Canon); `scan-archive` darf sie nicht mehr überschreiben.
+- **Anfrage-PDFs liegen im `Archiv/` neben den Antworten** und sehen auf Seite 1 fast identisch aus (selbe KA-Nr, selbe Anfrager-Zeile). Filter über die Antwort-spezifischen Phrasen `Vorbemerkung der Kleinen Anfrage` / `hat die Kleine Anfrage` (siehe `is_antwort_drucksache`).
+- **Antworten auf „Große Anfragen"** liegen ebenfalls im selben Format vor, gehören aber nicht in den KA-Index. Filter: Header-Phrase `Antwort der Landesregierung auf die Große Anfrage` (siehe `is_grosse_anfrage`).
+- **„Unterrichtung des Präsidenten"** statt einer regulären Antwort = die Anfrage wurde von der Fraktion zurückgezogen. Status `anfrage_zurueckgezogen`; Ministerium und Antworttext werden nicht erwartet.
+- **`Vormerkung` vs. `Vorbemerkung`** → frühe WP18-Antworten verwenden die alte Schreibweise. Der Title-Regex akzeptiert beide.
+- **Antwort-Drucksache ist nicht durchsuchbar** → `nummer=18/1006` liefert 0 Hits. Nur die **Frage**-Drucksache (`nummer=18/675`) findet die KA.
+- **`fetch-text` meldet viele 404** → meist Zeilen aus `crawl --full` für noch unbeantwortete Anfragen. Status `no_answer_yet` ist erwartet; später erneut laufen lassen.
+- **Zeilenanzahl nach `scan-archive` < PDF-Zahl** → fehlgeschlagene Regex-Matches; `data/extract_errors.log` prüfen.
+
+---
+
+## Hinweise
+
+- **robots.txt:** Die Suche unter `landtag.nrw.de` ist für Indexer per `Disallow` gesperrt. Dieses Projekt ist ein gezielter Datenextraktions-Agent für journalistische / öffentliche Recherche — kein Indexer — und damit nicht durch das `Disallow` adressiert. Höflichkeit wird über `--rps 4` und einen identifizierenden User-Agent sichergestellt.
+- **Scope:** WP18 ist Standard; WP17/WP16 sind über `--wahlperiode` erreichbar.
+- **LLM-Aufrufe:** komplett opt-in (nur hinter `verify --llm-*`), gehen über die `llm`-Library; Default-Backend ist lokales Ollama. Es verlassen keine Daten den Rechner, solange kein Cloud-Modell explizit konfiguriert wird.
+
+Vollständige Spezifikation und Designentscheidungen: [`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`](docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md).
+Aktueller Stand und Lücken: [`HANDOVER.md`](HANDOVER.md).

@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Read these first
 
-- **`HANDOVER.md`** — current state, what's tested vs untested, OneDrive performance gotcha, recommended next steps. Read this before doing anything else.
-- **`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`** — full design spec.
-- **`skills/landtag-nrw-extraction/SKILL.md`** — operator-facing recipe for the four CLI verbs.
+- **`README.md`** — current pipeline overview (crawl → fetch-text → scan-archive → verify), six CLI verbs, known gotchas. Start here.
+- **`skills/landtag-nrw-extraction/SKILL.md`** — agent-facing recipe with refresh loop and Nachrecherche-Strategie via `resolve`.
+- **`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`** — original design spec (architecture intent; pipeline reordering is newer).
+- **`auswertung_fehlende_daten.md`** — operator observations on data quality issues (largely addressed).
 
 ## Project context
 

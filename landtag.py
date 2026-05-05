@@ -1676,7 +1676,11 @@ def match_ministerium(value: str, canonicals: list[tuple[str, str, set[str]]]) -
 # Drucksache N/M" onto the boundary paragraph with a single newline, so
 # blank-line paragraph splits don't isolate it cleanly.
 _RX_MIN_BOUNDARY = re.compile(
-    r"(?:Der|Die)\s+Minister(?:präsident(?:in)?|in)?\b"
+    # Determiner — Nominativ (Der/Die/Das) at sentence-start of the boundary
+    # paragraph. Role — Minister(in), Ministerpräsident(in), Ministerium,
+    # Ministerien (plural — observed when the boundary paragraph names two
+    # ministries jointly via "Die Ministerien für X und Y").
+    r"(?:Der|Die|Das)\s+Minister(?:präsident(?:in)?|in|ium|ien)?\b"
     r".{0,800}?"
     r"\bdie\s+Kleine\s+Anfrage\s+\d+"
     r".{0,400}?"
@@ -1706,8 +1710,14 @@ def find_minister_paragraph(text: str) -> str | None:
 #   Comma is NOT a stop — body itself often contains commas (e.g. "Kinder,
 #   Jugend, Familie, Gleichstellung, Flucht und Integration").
 _RX_MIN_FORM = re.compile(
-    r"\b(?:Der|Die|dem|der|des|den)\s+"
-    r"(Minister(?:präsident(?:in)?|in)?)\s+"
+    # Determiner: Nominativ "Der/Die/Das" at sentence start; lowercase
+    # der/die/das/dem/des/den mid-paragraph (Dativ/Genitiv/Akkusativ).
+    # Role: Minister, Ministerin, Ministerium, Ministerien, plus
+    # Ministerpräsident(in) — all treated equivalently. The capture group
+    # only flows into the human-readable form string; the resolver tokenises
+    # away the role suffix so it doesn't affect Kürzel matching.
+    r"\b(?:Der|Die|Das|der|die|das|dem|des|den)\s+"
+    r"(Minister(?:präsident(?:in)?|in|ium|ien)?)\s+"
     r"(für|der|des)\s+"
     r"(.+?)"
     # Stop alternatives — each carries its own leading-space rule. The

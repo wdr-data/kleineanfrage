@@ -7,6 +7,9 @@ data/
 .DS_Store
 .[0-9A-F]*-[0-9A-F]*-[0-9A-F]*-[0-9A-F]*-[0-9A-F]*
 
+# LibreOffice / Excel lock files (sibling .~lock.X#)
+.~lock.*#
+
 # Python
 __pycache__/
 *.py[cod]

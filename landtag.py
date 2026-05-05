@@ -1033,6 +1033,10 @@ def cmd_scan_archive(args: argparse.Namespace) -> int:
                 file=sys.stderr, flush=True,
             )
 
+    # Re-normalize so flags include unknown_ministerium_kuerzel, novel_ministerium
+    # etc. — compute_extract_flags called in the loop above only rebuilds the
+    # missing_*/novel_fraktion subset.
+    apply_normalization(rows)
     print(f"saving {len(rows)} rows to {xlsx} ...", file=sys.stderr, flush=True)
     save_index(rows, xlsx)
     print(

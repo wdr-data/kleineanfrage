@@ -92,6 +92,9 @@ COLUMNS = [
     "Fraktion_Canonical",       # canonical Fraktion from Index/fraktionen.xlsx
     "Ministerium_Canonical",    # canonical Ministerium from Index/ministerien.xlsx
     "Ministerium_Kuerzel",      # corresponding Kürzel (e.g. "MSB", "JM") — federführend
+    "Beteiligte_Ministerien",   # int count of beteiligte ministries (= number
+                                # of comma-separated tokens in the next column).
+                                # 0 if the boundary paragraph wasn't matched.
     "Beteiligte_Ministerien_Kuerzel",  # ALL ministries on the answer paragraph,
                                 # comma-separated, federführend first. Filled by
                                 # extract-multi-ministerium from the PDF body.
@@ -139,6 +142,7 @@ class Record:
     fraktion_canonical: str = ""
     ministerium_canonical: str = ""
     ministerium_kuerzel: str = ""
+    beteiligte_ministerien: int = 0           # count of beteiligte ministries
     beteiligte_ministerien_kuerzel: str = ""  # ","-joined Kürzel set, federführend first
     extract_flags: str = ""                # ","-joined quality markers (see _row_quality_flags)
     hinzugefuegt_am: str = ""
@@ -431,6 +435,7 @@ _FIELD_TO_COL = {
     "fraktion_canonical": "Fraktion_Canonical",
     "ministerium_canonical": "Ministerium_Canonical",
     "ministerium_kuerzel": "Ministerium_Kuerzel",
+    "beteiligte_ministerien": "Beteiligte_Ministerien",
     "beteiligte_ministerien_kuerzel": "Beteiligte_Ministerien_Kuerzel",
     "extract_flags": "Extract_Flags",
     "hinzugefuegt_am": "Hinzugefuegt_am",
@@ -462,7 +467,7 @@ def load_index(xlsx: Path = INDEX_XLSX) -> dict[str, Record]:
                     if val is None:
                         continue
                     field_name = _COL_TO_FIELD[col_name]
-                    if field_name in ("wp", "kleine_anfrage_nr"):
+                    if field_name in ("wp", "kleine_anfrage_nr", "beteiligte_ministerien"):
                         try:
                             kwargs[field_name] = int(val)
                         except (TypeError, ValueError):
@@ -815,9 +820,17 @@ def parse_search_hits(html: str) -> list[Record]:
         if len(dates) >= 2:
             rec.antwortdatum = _german_date_to_iso(dates[1])
 
-        # Antwortendes Ministerium: literal "Antwort " + ALL-CAPS Kürzel.
-        # Anchored on "Antwort\nKÜRZEL" to avoid misfires inside body prose.
-        m = re.search(r"\bAntwort\s+([A-ZÄÖÜ]{2,10})\b", text)
+        # Antwortendes Ministerium: structural line "Antwort KÜRZEL" followed
+        # by the answer-Drucksache line — that pair is the fingerprint of the
+        # actual Antwort-block at the bottom of every search-hit body.
+        # A bare \b-anchored match (the previous version) misfires when the
+        # Inhaltsbeschreibung contains "Antwort BT-Drs. 17/8134" and similar
+        # citations of foreign-parliament Drucksachen (e.g. KA 331/WP17 → BT,
+        # KA 6451/WP17 → BMWK).
+        m = re.search(
+            r"^Antwort\s+([A-ZÄÖÜ]{2,10})\s*\n\s*Drucksache\s+\d+/\d+",
+            text, re.MULTILINE,
+        )
         if m:
             rec.ministerium_kuerzel = m.group(1)
         # Withdrawn KAs: instead of "Antwort <Kürzel>" the second block reads
@@ -1760,6 +1773,13 @@ def resolve_minister_form(
     return hit[0] if hit else None
 
 
+def _count_beteiligte(kuerzel_str: str) -> int:
+    """Count of comma-separated Kürzel in a Beteiligte_Ministerien_Kuerzel value."""
+    if not kuerzel_str:
+        return 0
+    return sum(1 for k in kuerzel_str.split(",") if k.strip())
+
+
 def cmd_extract_multi_ministerium(args: argparse.Namespace) -> int:
     """Read each row's Antworttext .md, parse the boundary paragraph for ALL
     answering ministries, write Kürzel-Set to Beteiligte_Ministerien_Kuerzel.
@@ -1800,6 +1820,7 @@ def cmd_extract_multi_ministerium(args: argparse.Namespace) -> int:
         if not para:
             counters["no_para"] += 1
             rec.beteiligte_ministerien_kuerzel = ""
+            rec.beteiligte_ministerien = 0
             continue
 
         # Phase B: full-forms → Kürzel, deduped, ordered
@@ -1819,6 +1840,7 @@ def cmd_extract_multi_ministerium(args: argparse.Namespace) -> int:
                 log_vocab_novelty(rec.drucksache_antwort_nr or "", "ministerium_form", form)
 
         rec.beteiligte_ministerien_kuerzel = ",".join(kuerzel_order)
+        rec.beteiligte_ministerien = len(kuerzel_order)
         if len(kuerzel_order) >= 2:
             counters["multi"] += 1
         elif len(kuerzel_order) == 1:
@@ -1880,6 +1902,14 @@ def apply_normalization(rows: dict) -> dict:
             if full:
                 rec.ministerium_canonical = full
                 counters["min_matched_kuerzel"] = counters.get("min_matched_kuerzel", 0) + 1
+            else:
+                # Kürzel set but unknown — likely a parser misfire (e.g. "BT"
+                # picked up from "Antwort BT-Drs." in the Inhaltsbeschreibung)
+                # or a source-data typo on landtag.nrw.de (e.g. "AWEL"). Surface
+                # via flag + novelty log so an operator can reconcile.
+                rec.ministerium_canonical = ""
+                counters["min_novel"] += 1
+                log_vocab_novelty(rec.drucksache_antwort_nr or "", "ministerium_kuerzel", kz)
         elif rec.ministerium:
             kuerzel = aliases.get(rec.ministerium)
             if kuerzel:
@@ -1906,15 +1936,25 @@ def apply_normalization(rows: dict) -> dict:
             rec.ministerium_canonical = ""
             counters["min_novel"] += 1
 
+        # Keep Beteiligte_Ministerien (count) in sync with the Kürzel column
+        # after every normalize — so a backfilled or hand-edited Kürzel string
+        # immediately reflects in the count column.
+        rec.beteiligte_ministerien = _count_beteiligte(rec.beteiligte_ministerien_kuerzel)
+
         # Rebuild flag set: missing_* recomputed (so stale flags drop after a
         # field got filled), then novel_ministerium added if no canonical resolved.
         base = compute_extract_flags(rec)
-        # Preserve non-missing/non-novel flags caller may have set elsewhere.
+        # Preserve non-missing/non-novel/non-unknown flags caller may have set elsewhere.
         existing = [f for f in rec.extract_flags.split(",")
-                    if f and not f.startswith("missing_") and not f.startswith("novel_")]
+                    if f and not f.startswith("missing_")
+                    and not f.startswith("novel_")
+                    and f != "unknown_ministerium_kuerzel"]
         flags = existing + ([f for f in base.split(",") if f] if base else [])
         if rec.ministerium and not rec.ministerium_canonical:
             flags.append("novel_ministerium")
+        # Kürzel set but not resolvable against ministerien.xlsx → fragwürdig.
+        if rec.ministerium_kuerzel and not rec.ministerium_canonical:
+            flags.append("unknown_ministerium_kuerzel")
         # de-dupe, preserve order
         seen = set(); out_flags = []
         for f in flags:

@@ -1,6 +1,9 @@
-# local PDF cache + extracted text — regenerable, not in git
+# local PDF cache — regenerable, not in git (large)
 Archiv/
-data/
+
+# data/ now tracked: index.xlsx, Auswertungen, ministerien_erkennung.xlsx,
+# logs. .DS_Store and the OneDrive cloud-stub files are still ignored
+# globally (rules below).
 
 # Claude Code per-user settings + OneDrive sync metadata
 .claude/

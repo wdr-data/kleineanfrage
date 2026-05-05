@@ -2,11 +2,14 @@
 
 Strukturierte Daten zu **Kleinen Anfragen** des Landtags Nordrhein-Westfalen lokal extrahieren — Metadaten in einer Excel-Datei, Antworttexte als Markdown neben den Original-PDFs.
 
-Entwickelt für journalistische Recherche im WDR. Eine einzelne `landtag.py` umschließt eine XLSX-Datei und einen lokalen PDF-Cache (`Archiv/`); keine Datenbank, kein Paket-Setup.
+Wer hat wann was gefragt - und welches Ministerium hat wie schnell geantwortet? Die Daten aus der Datenbank - und die Verweise auf die Volltexte - landen in einer Excel-Tabelle (`index.xlsx`), die eine weitere Auswertung erlaubt.
 
----
+## Auswertung in R
 
-## Was hier drin ist
+Im Ordner `R` findet sich das einfache Skript für die Auswertung der Tabelle.
+
+
+## Der Python-Code
 
 ```
 landtag.py                                   ← die gesamte Logik (eine Datei, ~750 Zeilen)
@@ -16,29 +19,21 @@ data/index.xlsx                              ← eine Zeile pro Kleiner Anfrage
 data/*.log                                   ← Extraktions-/Crawl-Fehler, Vokabel-Neulinge
 docs/superpowers/specs/2026-05-01-…design.md ← vollständiger Entwurf
 skills/landtag-nrw-extraction/SKILL.md       ← Skill-Definition für Agenten
-HANDOVER.md                                  ← aktueller Stand, getestet vs. ungetestet
 CLAUDE.md                                    ← Agenten-Briefing
 ```
 
 ---
 
-## Einmaliges Setup
+### Einmaliges Setup
 
 ```sh
 pip install -r requirements.txt
 brew install poppler          # liefert pdftotext (auf macOS)
 ```
 
-**Wichtig vor dem ersten Lauf:** `Archiv/` liegt in einem OneDrive-synchronisierten Ordner. OneDrive-On-Demand macht `pdftotext`-Zugriffe extrem langsam (Faktor 1000×). Eine der beiden Optionen wählen:
+## Der Agenten-Skill
 
-1. In der OneDrive-UI `Archiv/` als „Immer auf diesem Gerät verfügbar" markieren.
-2. `cp -r Archiv /tmp/wdr-archive` und dort arbeiten.
-
-Ohne diesen Schritt: `scan-archive` nur mit `--limit` ausführen.
-
----
-
-## Die Verben
+### Die Verben
 
 Alle Verben sind **idempotent** und teilen sich `data/index.xlsx` über einen File-Lock. Die Online-Suche (`crawl`) ist Canon — sie bestimmt, welche KAs der Wahlperiode existieren. `scan-archive` und `fetch-text` reichern den so aufgebauten Index an.
 
@@ -117,37 +112,3 @@ CSV-Export, falls ein externes Tool das braucht:
 ```sh
 python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv', index=False)"
 ```
-
-### Was Agenten **nicht** tun sollen
-
-- **Nicht zwei Verben gleichzeitig** auf derselben XLSX laufen lassen. Der Lock blockt zwar, aber sauberer ist es trotzdem nicht.
-- **Spalten `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` nicht von Hand editieren** — sie gehören `fetch-text`.
-- **Werte aus `data/vocab_novelty.log` nicht automatisch korrigieren.** Eine ungewohnte Fraktion oder ein ungewohntes Ministerium kann ein echter neuer Eintrag sein (Kabinettsumbildung, neuer Abgeordneter). Erst prüfen, dann ggf. die hartkodierten `FRAKTIONEN`/`MINISTERIEN`-Sets in `landtag.py` ergänzen.
-- **Server nicht hämmern.** `--rps 4` ist die voreingestellte höfliche Obergrenze. Höher nur mit gutem Grund.
-- **Bei `crawl`-Fehlern nicht blind retryen.** Spring-Webflow-Tokens sind single-use; das Re-Bootstrap pro Query ist bereits eingebaut. Wenn `crawl` 0 Hits liefert, hat sich vermutlich der HTML-Parser-Anker verschoben — `bootstrap_search` in `landtag.py` prüfen.
-
----
-
-## Bekannte Stolperfallen
-
-- **`pdftotext: not found`** → `brew install poppler` (macOS) bzw. distro-Äquivalent.
-- **`pdftotext` schluckt das D in „AfD"** → ca. 3 % der WP18-PDFs landen mit `Fraktion='Af'` in `vocab_novelty.log`. Patch wäre, die Fraktions-Alternation auf `(CDU|SPD|GRÜNE|FDP|AfD|Af|fraktionslos)` zu erweitern und `Af` → `AfD` zu normalisieren.
-- **`pdftotext` schluckt Leerzeichen** zwischen KA-Nr und „vom" → Pattern wie `Kleine Anfrage 6790 vom` wird als „6790**1**vom" bzw. „67901vom" extrahiert. Index pflegt deshalb die KA-Nr aus dem `crawl`-Treffer (Canon); `scan-archive` darf sie nicht mehr überschreiben.
-- **Anfrage-PDFs liegen im `Archiv/` neben den Antworten** und sehen auf Seite 1 fast identisch aus (selbe KA-Nr, selbe Anfrager-Zeile). Filter über die Antwort-spezifischen Phrasen `Vorbemerkung der Kleinen Anfrage` / `hat die Kleine Anfrage` (siehe `is_antwort_drucksache`).
-- **Antworten auf „Große Anfragen"** liegen ebenfalls im selben Format vor, gehören aber nicht in den KA-Index. Filter: Header-Phrase `Antwort der Landesregierung auf die Große Anfrage` (siehe `is_grosse_anfrage`).
-- **„Unterrichtung des Präsidenten"** statt einer regulären Antwort = die Anfrage wurde von der Fraktion zurückgezogen. Status `anfrage_zurueckgezogen`; Ministerium und Antworttext werden nicht erwartet.
-- **`Vormerkung` vs. `Vorbemerkung`** → frühe WP18-Antworten verwenden die alte Schreibweise. Der Title-Regex akzeptiert beide.
-- **Antwort-Drucksache ist nicht durchsuchbar** → `nummer=18/1006` liefert 0 Hits. Nur die **Frage**-Drucksache (`nummer=18/675`) findet die KA.
-- **`fetch-text` meldet viele 404** → meist Zeilen aus `crawl --full` für noch unbeantwortete Anfragen. Status `no_answer_yet` ist erwartet; später erneut laufen lassen.
-- **Zeilenanzahl nach `scan-archive` < PDF-Zahl** → fehlgeschlagene Regex-Matches; `data/extract_errors.log` prüfen.
-
----
-
-## Hinweise
-
-- **robots.txt:** Die Suche unter `landtag.nrw.de` ist für Indexer per `Disallow` gesperrt. Dieses Projekt ist ein gezielter Datenextraktions-Agent für journalistische / öffentliche Recherche — kein Indexer — und damit nicht durch das `Disallow` adressiert. Höflichkeit wird über `--rps 4` und einen identifizierenden User-Agent sichergestellt.
-- **Scope:** WP18 ist Standard; WP17/WP16 sind über `--wahlperiode` erreichbar.
-- **LLM-Aufrufe:** komplett opt-in (nur hinter `verify --llm-*`), gehen über die `llm`-Library; Default-Backend ist lokales Ollama. Es verlassen keine Daten den Rechner, solange kein Cloud-Modell explizit konfiguriert wird.
-
-Vollständige Spezifikation und Designentscheidungen: [`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`](docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md).
-Aktueller Stand und Lücken: [`HANDOVER.md`](HANDOVER.md).

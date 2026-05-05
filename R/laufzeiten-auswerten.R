@@ -202,15 +202,31 @@ for (wp in WAHLPERIODEN) {
     
     for (f in fraktionen) {
       fraktion_themen_zeitreihe_df <- sachgebiete(anfragen_df %>% 
-                                          filter(Fraktion == f))
-      
+                                          filter(Fraktion == f)) %>% 
+        group_by(periode) %>%
+        # Absteigend nach Anzahl sortieren
+        arrange(desc(Anzahl)) %>% 
+        # drei topthemen 
+        mutate(rank = row_number()) %>% 
+        slice_head(n = 3) %>% 
+        pivot_wider(
+          id_cols      = periode,
+          names_from   = rank,
+          values_from  = c(Sachgebiet, Anzahl),
+          names_glue   = "{.value}_{rank}"
+        ) %>% 
+        ungroup() %>% 
+        arrange(periode) %>% 
+        relocate(1,2,5,3,6,4,7) 
+        
       # Themen der Fraktion als Zeitreihe für diese Wahlperiode
       write.xlsx(fraktion_themen_zeitreihe_df,
                  paste0("data/WP",wp,"_sachgebiete_",f,"_zeitreihe.xlsx"),
                  overwrite=T)
       
       # Jetzt aufsummieren
-      fraktion_themen_df <- fraktion_themen_zeitreihe_df %>% 
+      fraktion_themen_df <- sachgebiete(anfragen_df %>% 
+                                          filter(Fraktion == f)) %>% 
       ungroup() %>% 
       group_by(Sachgebiet) %>% 
       mutate(sum_zeit = Zeit * Anzahl) %>%  # Zum Aufsummieren
@@ -220,8 +236,7 @@ for (wp in WAHLPERIODEN) {
         Zeit = sum(sum_zeit, na.rm=T ) / sum(Anzahl, na.rm=T),
         Verspätet = sum(Verspätet)
       ) %>% 
-      mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100)) %>% 
-      arrange(desc(Anzahl))
+      arrange(desc(Anzahl)) 
       
       # Schreiben
       write.xlsx(fraktion_themen_df,
@@ -230,7 +245,7 @@ for (wp in WAHLPERIODEN) {
       
     } 
     # Viele Mitwirkende, viel Verspätung?
-    mitwirkende_df <- anfragen_alle_df %>% 
+    mitwirkende_df <- anfragen_df %>% 
       # Bug in der Erzeugung der Ministerien-Anzahl fixen:
       # bei einigen gibt der Parser "0" an (wenn keine aus dem Text gefunden wurden)
       mutate(Beteiligte_Ministerien = ifelse(Beteiligte_Ministerien > 0, 
@@ -267,14 +282,28 @@ topthemen <- zeitreihe_df %>%
 
 themen_df <- zeitreihe_df %>% 
   # Jetzt haben wir für jedes Sachgebiet eine Zeile. Zählen.
-  filter(Sachgebiet %in% topthemen) %>% 
-  select(periode,Sachgebiet) %>% 
-  count(periode,Sachgebiet) %>% 
-  pivot_wider(names_from = Sachgebiet, values_from = n, values_fill = 0) %>%
-  arrange(periode) 
+  group_by(periode,Sachgebiet) %>% 
+  summarize(Anzahl = n()) %>% 
+  ungroup() %>% 
+  group_by(periode) %>%
+  # Absteigend nach Anzahl sortieren
+  arrange(desc(Anzahl)) %>% 
+  # drei topthemen 
+  mutate(rank = row_number()) %>% 
+  slice_head(n = 5) %>% 
+  pivot_wider(
+    id_cols      = periode,
+    names_from   = rank,
+    values_from  = c(Sachgebiet, Anzahl),
+    names_glue   = "{.value}_{rank}"
+  ) %>% 
+  ungroup() %>% 
+  arrange(periode) %>% 
+  relocate(1,2,7,3,8,4,9,5,10,6,11) 
+
 
 write.xlsx(themen_df,
-           paste0("data/ALLE_sachgebiete_zeitreihe.xlsx"),
+           paste0("data/ALLE_topthemen_zeitreihe.xlsx"),
            overwrite=T)
 
 # Summenverlauf alle Anfragen, alle Zeiten nach Monaten
@@ -294,5 +323,8 @@ anfragen_zeitreihe_df <- anfragen_alle_df %>%
 write.xlsx(anfragen_zeitreihe_df,
            "data/ALLE_zeitreihe.xlsx",
            overwrite=T)
+
+# 3 Topthemen mit Anzahl
+
 
     

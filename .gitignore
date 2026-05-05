@@ -21,8 +21,18 @@ __pycache__/
 venv/
 .env
 
+# R
+*.Rproj
+Rproj.user/
+
 # editors
 .vscode/
 .idea/
 .Rproj.user
 .positai
+
+# Konzept
+docs/
+
+# Journalistisch
+texte/

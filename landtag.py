@@ -1724,9 +1724,16 @@ _RX_MIN_FORM = re.compile(
     r"\s+wie\s+folgt\b|"
     r"\s+namens\s+der\s+Landesregierung\b|"
     r"\s+des\s+Landes\s+Nordrhein-Westfalen\b|"
-    r"\s+und\s+(?:mit\s+)?(?:dem|der|des|den)\s+Minister(?:präsident(?:in)?|in)?\b|"
-    r"\s+sowie\s+(?:mit\s+)?(?:dem|der|des|den)?\s*Minister(?:präsident(?:in)?|in)?\b|"
-    r"\s*,\s+(?:dem|der|des|den)\s+Minister(?:präsident(?:in)?|in)?\b"
+    # Stop alternatives bridging to the next minister. Each accepts:
+    #   - Minister(in), Ministerpräsident(in), Minister[ium|s|n] etc. via
+    #     [Mm]inister[a-zäöüß]* — lowercase m enables compound forms
+    #     ("Verkehrsminister"); permissive suffix covers Genitiv "Ministers",
+    #     plural "Ministerien" and the full "Ministerium" noun.
+    #   - Optional German compound prefix ([A-ZÄÖÜ][a-zäöüß]+) for
+    #     "Verkehrsminister", "Finanzminister", "Innenminister" etc.
+    r"\s+und\s+(?:mit\s+)?(?:dem|der|des|den)\s+(?:[A-ZÄÖÜ][a-zäöüß]+)?[Mm]inister[a-zäöüß]*\b|"
+    r"\s+sowie\s+(?:mit\s+)?(?:dem|der|des|den)?\s*(?:[A-ZÄÖÜ][a-zäöüß]+)?[Mm]inister[a-zäöüß]*\b|"
+    r"\s*,\s+(?:mit\s+)?(?:dem|der|des|den)\s+(?:[A-ZÄÖÜ][a-zäöüß]+)?[Mm]inister[a-zäöüß]*\b"
     r")"
 )
 
@@ -1746,6 +1753,11 @@ def _undo_pdf_hyphenation(s: str) -> str:
     s = re.sub(r"(\w)-([a-zäöüß])", r"\1\2", s)
     s = re.sub(r"(\w)-\s+(?!(?:und|oder|sowie|noch)\b)([a-zäöüß])", r"\1\2", s)
     s = re.sub(r"\bBundesund\b", "Bundes und", s)
+    # pdftotext occasionally swallows the space before the boilerplate
+    # token "namens" in "...Finanzen namens der Landesregierung", producing
+    # "Finanzennamens" — split it back so the namens-Landesregierung stop
+    # alternative still fires and the body doesn't run on past it.
+    s = re.sub(r"([a-zäöüß])namens\b", r"\1 namens", s)
     return s
 
 

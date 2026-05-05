@@ -1,10 +1,11 @@
 """One-shot helper: aggregate ministerium_form entries from data/vocab_novelty.log
-into data/ministerium_novelty.xlsx, ranked by occurrence count, with the
+into data/ministerien_erkennung.xlsx, ranked by occurrence count, with the
 best-guess Kürzel from Index/ministerien.xlsx (Jaccard / containment over the
-operator-curated tokenizer).
+operator-curated tokenizer). Joins WP and KA-Nr from data/index.xlsx for the
+first example Drucksache, so the operator can jump straight to the source.
 
 Run after `extract-multi-ministerium` to produce a triage list:
-    python build_novelty_table.py
+    python build_ministerien_erkennung.py
 """
 import re
 from collections import Counter, defaultdict
@@ -40,10 +41,21 @@ def best_match(form: str, canon_min):
     return (kz, full, contain, jacc)
 
 
+def load_drs_to_wp_ka() -> dict[str, tuple[int | None, int | None]]:
+    """Map Drucksache_Antwort_Nr → (WP, Kleine_Anfrage_Nr) from data/index.xlsx."""
+    rows = landtag.load_index()
+    return {
+        rec.drucksache_antwort_nr: (rec.wp, rec.kleine_anfrage_nr)
+        for rec in rows.values()
+        if rec.drucksache_antwort_nr
+    }
+
+
 def main():
     log_path = Path("data/vocab_novelty.log")
-    out_path = Path("data/ministerium_novelty.xlsx")
+    out_path = Path("data/ministerien_erkennung.xlsx")
     canon_min = landtag.load_canon_ministerien()
+    drs_lookup = load_drs_to_wp_ka()
 
     counts: Counter[str] = Counter()
     drs_by_form: defaultdict[str, list[str]] = defaultdict(list)
@@ -60,24 +72,28 @@ def main():
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "novelty"
+    ws.title = "ministerien_erkennung"
     ws.append([
-        "Häufigkeit", "Form (scraped)", "Vorschlag_Kuerzel",
-        "Vorschlag_Ministerium", "Containment", "Jaccard",
-        "Beispiel_Drucksachen",
+        "Häufigkeit", "WP", "KA_Nr", "Form (scraped)",
+        "Vorschlag_Kuerzel", "Vorschlag_Ministerium",
+        "Containment", "Jaccard",
+        "Erstes_Beispiel_Drucksache", "Weitere_Beispiele",
     ])
 
     for form, n in counts.most_common():
         kz, full, contain, jacc = best_match(form, canon_min)
-        examples = ", ".join(drs_by_form[form][:3])
+        examples = drs_by_form[form]
+        first = examples[0]
+        wp, ka = drs_lookup.get(first, (None, None))
+        rest = ", ".join(examples[1:4]) if len(examples) > 1 else ""
         ws.append([
-            n, form, kz, full,
+            n, wp, ka, form,
+            kz, full,
             round(contain, 2), round(jacc, 2),
-            examples,
+            first, rest,
         ])
 
-    # Auto-width-ish column hints
-    widths = [10, 80, 18, 70, 12, 10, 40]
+    widths = [10, 6, 8, 80, 18, 70, 12, 10, 18, 30]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 

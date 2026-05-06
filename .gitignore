@@ -24,6 +24,17 @@ venv/
 # R
 *.Rproj
 Rproj.user/
+.RData
+.Rhistory
+
+# index backups (timestamped)
+data/index.xlsx.bak.*
+
+# work-in-progress, not yet for the public repo
+skill-revision.md
+tools/
+data/db_index.xlsx
+data/index_fixed.xlsx
 
 # editors
 .vscode/

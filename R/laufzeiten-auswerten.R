@@ -23,7 +23,7 @@ p_load(stringr)
 p_load(openxlsx)
 
 # Quelldatei
-fname <- "data/index.xlsx"
+fname <- "data/index_fixed.xlsx"
 # 17. und 18. Wahlperiode. Wenn mehr Daten genutzt werden sollen muss der Index 
 # der Ministerien ergänzt werden, weil die sich von WP zu WP ändern. 
 
@@ -133,7 +133,7 @@ for (wp in WAHLPERIODEN) {
       mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100)) 
     
     write.xlsx(ministerien_df,
-               paste0("data/WP",wp,"_auswertung_ministerien.xlsx"),
+               paste0("data/WP",wp,"/WP",wp,"_auswertung_ministerien.xlsx"),
                overwrite=T)
     
     # Verspätung nach Fraktion
@@ -148,7 +148,7 @@ for (wp in WAHLPERIODEN) {
       arrange(desc(Anzahl))
     
     write.xlsx(parteien_df,
-               paste0("data/WP",wp,"_auswertung_parteien.xlsx"),
+               paste0("data/WP",wp,"/WP",wp,"_auswertung_parteien.xlsx"),
                overwrite=T)
     
     # Verspätung nach Abgeordneten
@@ -175,7 +175,7 @@ for (wp in WAHLPERIODEN) {
       arrange(desc(Anzahl))
     
     write.xlsx(abgeordnete_df,
-               paste0("data/WP",wp,"_auswertung_abgeordnete.xlsx"),
+               paste0("data/WP",wp,"/WP",wp,"_auswertung_abgeordnete.xlsx"),
                overwrite=T)
     
     # Sachgebiete in dieser Legislaturperiode
@@ -194,7 +194,7 @@ for (wp in WAHLPERIODEN) {
       arrange(desc(Anzahl))
     
     write.xlsx(sachgebiete_df,
-               paste0("data/WP",wp,"_auswertung_sachgebiete.xlsx"),
+               paste0("data/WP",wp,"/WP",wp,"_auswertung_sachgebiete.xlsx"),
                overwrite=T)
     
     # Sachgebiete nach Fraktion in dieser WP
@@ -221,7 +221,7 @@ for (wp in WAHLPERIODEN) {
         
       # Themen der Fraktion als Zeitreihe für diese Wahlperiode
       write.xlsx(fraktion_themen_zeitreihe_df,
-                 paste0("data/WP",wp,"_sachgebiete_",f,"_zeitreihe.xlsx"),
+                 paste0("data/WP",wp,"/WP",wp,"_sachgebiete_",f,"_zeitreihe.xlsx"),
                  overwrite=T)
       
       # Jetzt aufsummieren
@@ -240,7 +240,7 @@ for (wp in WAHLPERIODEN) {
       
       # Schreiben
       write.xlsx(fraktion_themen_df,
-                 paste0("data/WP",wp,"_sachgebiete_",f,".xlsx"),
+                 paste0("data/WP",wp,"/WP",wp,"_sachgebiete_",f,".xlsx"),
                  overwrite=T)
       
     } 
@@ -258,7 +258,7 @@ for (wp in WAHLPERIODEN) {
       mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100))
     
     write.xlsx(mitwirkende_df,
-               paste0("data/WP",wp,"_beteiligte_ministerien.xlsx"),
+               paste0("data/WP",wp,"/WP",wp,"_beteiligte_ministerien.xlsx"),
                overwrite=T)
 }  
 
@@ -324,7 +324,22 @@ write.xlsx(anfragen_zeitreihe_df,
            "data/ALLE_zeitreihe.xlsx",
            overwrite=T)
 
-# 3 Topthemen mit Anzahl
+# 3 längste, 3 schnellste
+extreme_df <- anfragen_alle_df %>% 
+  filter(wp=="18") %>% 
+  arrange(desc(Antwortzeit)) %>% 
+  slice_head(n=3) %>% 
+  bind_rows(anfragen_alle_df %>% 
+              filter(wp=="18") %>% 
+              filter(!is.na(Antwortzeit)) %>% 
+              arrange(desc(Antwortzeit)) %>% 
+              slice_tail(n=3)) %>% 
+  select(wp,Kleine_Anfrage_Nr,Anfrager,Anfragedatum,Anfragetitel,Antwortdatum,
+         Ministerium_Kuerzel,Beteiligte_Ministerien_Kuerzel,
+         Beteiligte_Ministerien,Antwortzeit,
+         Link_Drucksache_Anfrage,
+         Link_Drucksache_Antwort)
 
+write.xlsx(extreme_df,"data/WP18/WP18_extremwerte.xlsx")
 
     

@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data"
 ARCHIV_DIR = REPO_ROOT / "Archiv"
 INDEX_XLSX = DATA_DIR / "index.xlsx"
+DB_INDEX_XLSX = DATA_DIR / "db_index.xlsx"  # immutable DB snapshot, written only by crawl
 SHEET_NAME = "kleine_anfragen"
 
 USER_AGENT = "wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)"
@@ -98,6 +99,15 @@ COLUMNS = [
     "Beteiligte_Ministerien_Kuerzel",  # ALL ministries on the answer paragraph,
                                 # comma-separated, federführend first. Filled by
                                 # extract-multi-ministerium from the PDF body.
+    "Anfrager_Alle",            # ALL co-signing Abgeordnete of the KA, '; '-joined
+                                # in 'Nachname, Vorname' form (federführend first).
+                                # Search-hit gives only the first 2 + 'u.a.' marker;
+                                # this column is the authoritative full list, parsed
+                                # from the Antwort-PDF header by extract-all-anfrager
+                                # against Index/abgeordnete.xlsx.
+    "Anzahl_Abgeordnete",       # int count of co-signers (= number of '; '-tokens
+                                # in Anfrager_Alle). 0 if extract-all-anfrager hasn't
+                                # populated this row yet.
     "Extract_Flags",
     "Hinzugefuegt_am",
     "Aktualisiert_am",
@@ -144,6 +154,8 @@ class Record:
     ministerium_kuerzel: str = ""
     beteiligte_ministerien: int = 0           # count of beteiligte ministries
     beteiligte_ministerien_kuerzel: str = ""  # ","-joined Kürzel set, federführend first
+    anfrager_alle: str = ""                # "; "-joined "Nachname, Vorname" — full list
+    anzahl_abgeordnete: int = 0            # count of tokens in anfrager_alle
     extract_flags: str = ""                # ","-joined quality markers (see _row_quality_flags)
     hinzugefuegt_am: str = ""
     aktualisiert_am: str = ""
@@ -437,6 +449,8 @@ _FIELD_TO_COL = {
     "ministerium_kuerzel": "Ministerium_Kuerzel",
     "beteiligte_ministerien": "Beteiligte_Ministerien",
     "beteiligte_ministerien_kuerzel": "Beteiligte_Ministerien_Kuerzel",
+    "anfrager_alle": "Anfrager_Alle",
+    "anzahl_abgeordnete": "Anzahl_Abgeordnete",
     "extract_flags": "Extract_Flags",
     "hinzugefuegt_am": "Hinzugefuegt_am",
     "aktualisiert_am": "Aktualisiert_am",
@@ -467,7 +481,7 @@ def load_index(xlsx: Path = INDEX_XLSX) -> dict[str, Record]:
                     if val is None:
                         continue
                     field_name = _COL_TO_FIELD[col_name]
-                    if field_name in ("wp", "kleine_anfrage_nr", "beteiligte_ministerien"):
+                    if field_name in ("wp", "kleine_anfrage_nr", "beteiligte_ministerien", "anzahl_abgeordnete"):
                         try:
                             kwargs[field_name] = int(val)
                         except (TypeError, ValueError):
@@ -481,16 +495,21 @@ def load_index(xlsx: Path = INDEX_XLSX) -> dict[str, Record]:
         return out
 
 
-def save_index(rows: dict[str, Record], xlsx: Path = INDEX_XLSX) -> None:
-    """Write rows to a temp xlsx, fsync, atomic rename. Holds filelock."""
+def save_index(rows: dict[str, Record], xlsx: Path = INDEX_XLSX,
+               columns: list[str] = COLUMNS) -> None:
+    """Write rows to a temp xlsx, fsync, atomic rename. Holds filelock.
+
+    columns selects which columns to write (default: full schema). Pass
+    DB_COLUMNS to write the DB-snapshot subset (db_index.xlsx).
+    """
     xlsx.parent.mkdir(parents=True, exist_ok=True)
     with _xlsx_lock(xlsx):
         wb = openpyxl.Workbook(write_only=True)
         ws = wb.create_sheet(SHEET_NAME)
-        ws.append(COLUMNS)
+        ws.append(columns)
         for key in sorted(rows.keys(), key=_drucksache_sort_key):
             rec = rows[key]
-            ws.append([_xlsx_value(getattr(rec, _COL_TO_FIELD[c])) for c in COLUMNS])
+            ws.append([_xlsx_value(getattr(rec, _COL_TO_FIELD[c])) for c in columns])
         with tempfile.NamedTemporaryFile(
             "wb", delete=False, dir=xlsx.parent, prefix=".index_", suffix=".xlsx"
         ) as tmp:
@@ -616,6 +635,7 @@ VOCAB_NOVELTY_LOG = DATA_DIR / "vocab_novelty.log"
 EXTRACT_ERRORS_LOG = DATA_DIR / "extract_errors.log"
 CRAWL_ERRORS_LOG = DATA_DIR / "crawl_errors.log"
 VERIFY_LLM_LOG = DATA_DIR / "verify_llm.log"
+ANFRAGER_NOVELTY_LOG = DATA_DIR / "anfrager_novelty.log"
 
 
 def _append_log(path: Path, line: str) -> None:
@@ -1059,6 +1079,28 @@ _CRAWL_FIELDS = {
     "antworttext_status",
 }
 
+# db_index.xlsx column subset: every field whose source is the Landtag search/DB
+# (no PDF-derived enrichment columns). Includes timestamps for traceability.
+DB_COLUMNS = [
+    "WP",
+    "Kleine_Anfrage_Nr",
+    "Drucksache_Anfrage_Nr",
+    "Drucksache_Antwort_Nr",
+    "Anfrager",
+    "Fraktion",
+    "Anfragedatum",
+    "Anfragetitel",
+    "Antwortdatum",
+    "Systematik",
+    "Schlagworte",
+    "Link_Drucksache_Anfrage",
+    "Link_Drucksache_Antwort",
+    "Ministerium_Kuerzel",
+    "Antworttext_Status",
+    "Hinzugefuegt_am",
+    "Aktualisiert_am",
+]
+
 
 def _date_in_range(iso: str, lo: str | None, hi: str | None) -> bool:
     if lo and iso < lo:
@@ -1197,10 +1239,12 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     print(f"saving {len(rows)} rows to {xlsx} ...", file=sys.stderr, flush=True)
     apply_normalization(rows)
     save_index(rows, xlsx)
+    save_index(rows, DB_INDEX_XLSX, columns=DB_COLUMNS)
     print(
         f"crawl done: pages={page} hits={counters['hits']} "
         f"matched={counters['matched_existing']} new={counters['new']} "
-        f"migrated={counters['migrated']} cleanup={cleaned} filtered={counters['filtered']}",
+        f"migrated={counters['migrated']} cleanup={cleaned} filtered={counters['filtered']} "
+        f"(snapshot → {DB_INDEX_XLSX.name})",
         file=sys.stderr, flush=True,
     )
     return 0
@@ -1806,6 +1850,365 @@ def _count_beteiligte(kuerzel_str: str) -> int:
     return sum(1 for k in kuerzel_str.split(",") if k.strip())
 
 
+# --- abgeordnete index + multi-anfrager parser ------------------------------
+#
+# The Landtag search-hit truncates the Anfrager list to the first 2 names plus
+# 'u.a.' when 3+ Abgeordnete co-sign a Kleine Anfrage. The Antwort-PDF header
+# carries the full list ("Vorname Nachname, ... und Vorname Nachname FRAKTION").
+#
+# Strategy: bootstrap an Index/abgeordnete.xlsx of (WP, Fraktion, Nachname,
+# Vorname) tuples from the reliable first-2 names in the DB, then use it as
+# a known-name lexicon to greedy-substring-match the PDF Anfragerblock.
+# Iteration: rows beyond DB-cap can introduce names not yet in the index;
+# residue is logged to data/anfrager_novelty.log; rerun build → extract until
+# residue is empty.
+
+# Match Anfragerblock(s) in the Antwort-PDF text. Generous body window (1000
+# chars) because some PDFs split names across many lines. Terminate on the
+# Fraktion marker — accept both 'GRÜNE/N' and the full 'BÜNDNIS 90/DIE GRÜNEN'.
+# pdftotext occasionally drops whitespace at word boundaries (e.g. WP17 KA 6:
+# 'der AbgeordnetenVerena Schäffer'); accept either explicit whitespace OR an
+# upper-case letter directly following 'Abgeordneten' as the start of the names.
+_RX_ANFRAGERBLOCK = re.compile(
+    r"(?:des|der)\s+Abgeordneten(?:\s+|(?=[A-ZÄÖÜ]))"
+    r"(.{1,1000}?)\s*"
+    # PDF whitespace is lossy — accept missing spaces in 'DIE GRÜNEN' / '90/DIE'.
+    r"(?:BÜNDNIS\s*90\s*/\s*DIE\s*GRÜNEN?|CDU|SPD|GRÜNEN?|FDP|AfD|fraktionslos)\b",
+    re.DOTALL,
+)
+
+# Title prefixes that pdftotext keeps in the Nachname slot of the DB
+# ("Dr. Maelzer, Dennis"). Convert to PDF form by hoisting them in front
+# of the Vorname ("Dr. Dennis Maelzer").
+_RX_NAME_TITLE = re.compile(r"^((?:(?:Prof\.|Dr\.)\s+)+)(.*)$")
+
+
+def parse_db_anfrager(s: str) -> list[tuple[str, str]]:
+    """'Becker, Horst; Klocke, Arndt u.a.' → [('Becker','Horst'), ('Klocke','Arndt')].
+
+    Strips the trailing 'u.a.' marker. Each token must contain ', ' to split
+    Nachname,Vorname; tokens without it (rare data glitches) are skipped.
+    """
+    out: list[tuple[str, str]] = []
+    for raw in s.split("; "):
+        part = raw.strip()
+        if part.endswith(" u.a."):
+            part = part[: -len(" u.a.")].strip()
+        if not part or part == "u.a.":
+            continue
+        if ", " not in part:
+            continue
+        nach, vor = part.split(", ", 1)
+        out.append((nach.strip(), vor.strip()))
+    return out
+
+
+def db_to_pdf_form(nach: str, vor: str) -> str:
+    """('Berg', 'Guido van den')  → 'Guido van den Berg'.
+    ('Dr. Maelzer', 'Dennis')      → 'Dr. Dennis Maelzer'.
+
+    Title prefixes (Dr./Prof.) on Nachname are hoisted in front of Vorname
+    because that is how the Antwort-PDF renders the name.
+    """
+    m = _RX_NAME_TITLE.match(nach)
+    if m:
+        title = m.group(1).strip()
+        nach_clean = m.group(2).strip()
+        return f"{title} {vor} {nach_clean}".strip()
+    return f"{vor} {nach}"
+
+
+def db_to_pdf_form_aliases(nach: str, vor: str) -> list[str]:
+    """All name forms an Antwort-PDF might render for ('Nachname', 'Vorname').
+
+    Returns the canonical form plus simplified variants:
+      - drop trailing middle initials  ('Sven W.' → 'Sven')
+      - drop hyphenated middle parts   ('Lisa-Kristin' → 'Lisa')
+      - drop title prefixes            ('Dr. Hartmut' → 'Hartmut')
+    The match step uses longest-first ordering, so canonical forms win when
+    both are present in the PDF.
+    """
+    aliases: list[str] = [db_to_pdf_form(nach, vor)]
+    # First-token first name (handles 'Sven W.', 'Lisa-Kristin', 'Michael R.').
+    vor_first = re.split(r"[\s\-]", vor.strip(), maxsplit=1)[0]
+    if vor_first and vor_first != vor:
+        aliases.append(db_to_pdf_form(nach, vor_first))
+    # Title-stripped variant (PDF sometimes drops 'Dr.' / 'Prof.').
+    m = _RX_NAME_TITLE.match(nach)
+    if m:
+        nach_clean = m.group(2).strip()
+        aliases.append(f"{vor} {nach_clean}")
+        if vor_first and vor_first != vor:
+            aliases.append(f"{vor_first} {nach_clean}")
+    # Dedup, preserve order.
+    seen = set()
+    out: list[str] = []
+    for a in aliases:
+        if a and a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def _abgeordnete_xlsx_path() -> Path:
+    return INDEX_DIR / "abgeordnete.xlsx"
+
+
+def load_abgeordnete_index() -> dict[tuple[int, str], list[tuple[str, str, str]]]:
+    """Return {(wp, fraktion): [(pdf_form, nach, vor), ...]} sorted by
+    len(pdf_form) DESC so longest forms are tried first during matching
+    (avoids 'Beucker' shadowing 'Dr. Hartmut Beucker')."""
+    path = _abgeordnete_xlsx_path()
+    if not path.exists():
+        return {}
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if header is None:
+        wb.close()
+        return {}
+    h = {name: i for i, name in enumerate(header) if name is not None}
+    out: dict[tuple[int, str], list[tuple[str, str, str]]] = {}
+    for row in rows_iter:
+        wp = row[h.get("WP", -1)] if "WP" in h else None
+        frak = row[h.get("Fraktion", -1)] if "Fraktion" in h else None
+        nach = row[h.get("Nachname", -1)] if "Nachname" in h else None
+        vor = row[h.get("Vorname", -1)] if "Vorname" in h else None
+        pdf_form = row[h.get("PDF_Form", -1)] if "PDF_Form" in h else None
+        if not (wp and frak and pdf_form and nach and vor):
+            continue
+        out.setdefault((int(wp), str(frak)), []).append(
+            (str(pdf_form), str(nach), str(vor))
+        )
+    wb.close()
+    for k in out:
+        out[k].sort(key=lambda t: -len(t[0]))
+    return out
+
+
+def log_anfrager_novelty(drucksache: str, fraktion: str, residue: str, block: str) -> None:
+    """Append unmatched residue from a PDF Anfragerblock for later review."""
+    _append_log(
+        ANFRAGER_NOVELTY_LOG,
+        f'{_now_iso()} | {drucksache} | {fraktion} | residue="{residue}" | block="{block}"',
+    )
+
+
+def db_anfrager_min_count(s: str) -> int:
+    """Lower bound on the number of co-signers implied by the DB Anfrager string.
+
+    The Landtag search-hit truncates to 2 names + 'u.a.' when 3+ co-sign:
+      ''                        → 0 (no info)
+      'Schäffer, Verena'        → 1
+      'Becker, Horst; Klocke, Arndt' → 2
+      'Bischoff, Rainer; Börner, Frank u.a.' → 3 (lower bound; could be more)
+    """
+    if not s:
+        return 0
+    has_ua = " u.a." in s or s.endswith("u.a.")
+    n = len(parse_db_anfrager(s))
+    return n + 1 if has_ua and n >= 2 else n
+
+
+def cmd_build_abgeordnete_index(args: argparse.Namespace) -> int:
+    """Scan data/index.xlsx, accumulate distinct (WP, Fraktion, Nachname,
+    Vorname) tuples from the Anfrager column, write Index/abgeordnete.xlsx.
+
+    The first 2 names in any DB row are reliable (the bug is only that 3+
+    co-signers get truncated to 2 + 'u.a.'). Run this BEFORE extract-all-
+    anfrager, and rerun AFTER to absorb any names harvested from u.a. PDFs
+    that hadn't shown up as primary co-signers anywhere.
+    """
+    rows = load_index(Path(args.xlsx))
+    counter: dict[tuple[int, str, str, str], int] = {}
+    for rec in rows.values():
+        if not rec.wp or not rec.fraktion or not rec.anfrager:
+            continue
+        for nach, vor in parse_db_anfrager(rec.anfrager):
+            key = (rec.wp, rec.fraktion, nach, vor)
+            counter[key] = counter.get(key, 0) + 1
+        # Anfrager_Alle (if already populated) is the better, broader source —
+        # absorb any names not covered by the truncated DB Anfrager column.
+        if rec.anfrager_alle:
+            for nach, vor in parse_db_anfrager(rec.anfrager_alle):
+                key = (rec.wp, rec.fraktion, nach, vor)
+                counter[key] = counter.get(key, 0) + 1
+
+    # Per-person aggregation across Fraktionen within the same WP, to surface
+    # Fraktionswechsel (Abgeordnete who left their Fraktion mid-WP, e.g. Pretzell,
+    # Neppe). Each output row carries the OTHER Fraktionen this person appears
+    # under in 'Frueher_Fraktion' — useful both for documentation and for an
+    # operator-driven cross-Fraktion match if a row's PDF Anfragerblock names
+    # someone whose current Fraktion in the index doesn't include them yet.
+    by_person: dict[tuple[int, str, str], set[str]] = {}
+    for (wp, frak, nach, vor) in counter.keys():
+        by_person.setdefault((wp, nach, vor), set()).add(frak)
+
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    path = _abgeordnete_xlsx_path()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "abgeordnete"
+    ws.append([
+        "WP", "Fraktion", "Nachname", "Vorname", "PDF_Form",
+        "Is_Alias", "Frueher_Fraktion", "n_treffer",
+    ])
+    n_rows = 0
+    for (wp, frak, nach, vor), n in sorted(counter.items()):
+        other = sorted(by_person[(wp, nach, vor)] - {frak})
+        frueher = "; ".join(other)
+        for i, form in enumerate(db_to_pdf_form_aliases(nach, vor)):
+            ws.append([wp, frak, nach, vor, form, 0 if i == 0 else 1, frueher, n])
+            n_rows += 1
+    wb.save(path)
+    print(
+        f"build-abgeordnete-index done: {len(counter)} canonical, {n_rows} forms → {path}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_extract_all_anfrager(args: argparse.Namespace) -> int:
+    """Per row's .md: parse the Anfragerblock, match names against
+    Index/abgeordnete.xlsx (filtered by WP+Fraktion), write Anfrager_Alle
+    (DB form, '; '-joined, in order of appearance in the PDF) and
+    Anzahl_Abgeordnete back to data/index.xlsx.
+
+    The original Anfrager column is preserved verbatim. Anfrager_Alle is the
+    authoritative list for analysis. Unmatched residue from the Anfragerblock
+    is logged to data/anfrager_novelty.log for review.
+    """
+    xlsx = Path(args.xlsx)
+    rows = load_index(xlsx)
+    abg = load_abgeordnete_index()
+    if not abg:
+        print(
+            "ERROR: Index/abgeordnete.xlsx fehlt — vorher `build-abgeordnete-index` laufen lassen.",
+            file=sys.stderr,
+        )
+        return 2
+
+    counters = {
+        "scanned": 0, "matched": 0, "no_block": 0, "no_candidates": 0,
+        "novel_residue": 0, "skipped_status": 0, "plausi_mismatch": 0,
+    }
+
+    for rec in rows.values():
+        if args.wahlperiode is not None and rec.wp != args.wahlperiode:
+            continue
+        if rec.antworttext_status != STATUS_EXTRACTED or not rec.antworttext:
+            counters["skipped_status"] += 1
+            continue
+        # Operator-curated rows opt out of auto-overwrite. Add 'anfrager_manual'
+        # to Extract_Flags after a hand-correction so re-runs preserve it.
+        if "anfrager_manual" in (rec.extract_flags or "").split(","):
+            counters["skipped_status"] += 1
+            continue
+        md_path = REPO_ROOT / rec.antworttext
+        if not md_path.exists():
+            continue
+        counters["scanned"] += 1
+        try:
+            text = md_path.read_text(encoding="utf-8")
+        except Exception as e:
+            _append_log(
+                EXTRACT_ERRORS_LOG,
+                f"{_now_iso()} | {rec.drucksache_antwort_nr} | anfrager read: {e}",
+            )
+            continue
+
+        m = _RX_ANFRAGERBLOCK.search(text[:5000])
+        if not m:
+            counters["no_block"] += 1
+            block = ""
+        else:
+            block = re.sub(r"\s+", " ", m.group(1)).strip()
+            # pdftotext routinely drops whitespace at lower→upper word
+            # boundaries ('AnjaButschkau', 'undJürgen') and after punctuation
+            # ('Sven W.Tritschler'). Re-insert before matching so substring
+            # lookups against PDF_Form succeed.
+            block = re.sub(r"([a-zäöüß.])([A-ZÄÖÜ])", r"\1 \2", block)
+
+        candidates = abg.get((rec.wp, rec.fraktion), [])
+        if not candidates:
+            counters["no_candidates"] += 1
+            # Still run plausi-check below; just skip matching.
+            block = ""
+
+        # Greedy substring matching, longest forms first. Mask hits to prevent
+        # later (shorter) forms from re-matching already-consumed text.
+        masked = list(block)
+        matched: list[tuple[int, str, str]] = []
+        for pdf_form, nach, vor in candidates:
+            current = "".join(masked)
+            idx = current.find(pdf_form)
+            if idx < 0:
+                continue
+            left_ok = idx == 0 or not current[idx - 1].isalpha()
+            right_end = idx + len(pdf_form)
+            right_ok = right_end == len(current) or not current[right_end].isalpha()
+            if not (left_ok and right_ok):
+                continue
+            matched.append((idx, nach, vor))
+            for i in range(idx, right_end):
+                masked[i] = "\x00"
+
+        matched.sort(key=lambda t: t[0])
+        if matched:
+            rec.anfrager_alle = "; ".join(f"{nach}, {vor}" for _, nach, vor in matched)
+            rec.anzahl_abgeordnete = len(matched)
+            counters["matched"] += 1
+        else:
+            rec.anfrager_alle = ""
+            rec.anzahl_abgeordnete = 0
+
+        # Residue: anything in the block that is NOT consumed AND not separator
+        # noise. Title fragments ('Dr.', 'Prof.'), 'und', commas, semicolons,
+        # whitespace are expected leftover.
+        residue = "".join(masked).replace("\x00", " ")
+        residue = re.sub(r"\b(?:und|Dr\.?|Prof\.?|Professor|Frau|Herr)\b", " ", residue)
+        residue = re.sub(r"[\s,;.]+", " ", residue).strip()
+        if residue:
+            counters["novel_residue"] += 1
+            log_anfrager_novelty(
+                rec.drucksache_antwort_nr or "", rec.fraktion or "", residue, block
+            )
+
+        # Plausi-check: parsed count must not undershoot the DB count. Equal-or-
+        # higher is fine (the whole point of this verb is to recover names the
+        # search-hit dropped under 'u.a.'). Lower means a parser failure on this
+        # row — log loudly so the operator can re-recherchieren via the agent.
+        db_min = db_anfrager_min_count(rec.anfrager or "")
+        if rec.anzahl_abgeordnete < db_min:
+            counters["plausi_mismatch"] += 1
+            _append_log(
+                ANFRAGER_NOVELTY_LOG,
+                f'{_now_iso()} | {rec.drucksache_antwort_nr or ""} | '
+                f'{rec.fraktion or ""} | MISMATCH parsed={rec.anzahl_abgeordnete} '
+                f'db_min={db_min} | db_anfrager="{rec.anfrager or ""}" | '
+                f'block="{block}"',
+            )
+
+    save_index(rows, xlsx)
+    print(
+        f"extract-all-anfrager done: scanned={counters['scanned']} "
+        f"matched={counters['matched']} no_block={counters['no_block']} "
+        f"no_candidates={counters['no_candidates']} "
+        f"novel_residue={counters['novel_residue']} "
+        f"plausi_mismatch={counters['plausi_mismatch']}",
+        file=sys.stderr,
+    )
+    if counters["plausi_mismatch"]:
+        print(
+            f"WARNING: {counters['plausi_mismatch']} Zeilen haben weniger geparste "
+            f"Anfrager als die DB-Anfrager-Spalte erwartet — siehe MISMATCH-Einträge "
+            f"in {ANFRAGER_NOVELTY_LOG}. Skill-Abschnitt 'Edge-Case-Nachrecherche'.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_extract_multi_ministerium(args: argparse.Namespace) -> int:
     """Read each row's Antworttext .md, parse the boundary paragraph for ALL
     answering ministries, write Kürzel-Set to Beteiligte_Ministerien_Kuerzel.
@@ -1842,28 +2245,28 @@ def cmd_extract_multi_ministerium(args: argparse.Namespace) -> int:
             _append_log(EXTRACT_ERRORS_LOG, f"{_now_iso()} | {rec.drucksache_antwort_nr} | multi-min read: {e}")
             continue
 
-        para = find_minister_paragraph(text)
-        if not para:
-            counters["no_para"] += 1
-            rec.beteiligte_ministerien_kuerzel = ""
-            rec.beteiligte_ministerien = 0
-            continue
-
-        # Phase B: full-forms → Kürzel, deduped, ordered
+        # Phase B: full-forms → Kürzel, deduped, ordered.
+        # Federführend (DB Ministerium_Kuerzel) is the floor: every answered KA
+        # has at least one ministry, so we seed kuerzel_order from DB even if the
+        # PDF boundary paragraph is missing/unparseable.
         kuerzel_order: list[str] = []
         if rec.ministerium_kuerzel:
             primary = kuerzel_aliases.get(rec.ministerium_kuerzel, rec.ministerium_kuerzel)
             kuerzel_order.append(primary)
 
-        for form in extract_minister_full_forms(para):
-            k = resolve_minister_form(form, canon_min, aliases)
-            if k:
-                k = kuerzel_aliases.get(k, k)
-                if k not in kuerzel_order:
-                    kuerzel_order.append(k)
-            else:
-                counters["novel_form"] += 1
-                log_vocab_novelty(rec.drucksache_antwort_nr or "", "ministerium_form", form)
+        para = find_minister_paragraph(text)
+        if not para:
+            counters["no_para"] += 1
+        else:
+            for form in extract_minister_full_forms(para):
+                k = resolve_minister_form(form, canon_min, aliases)
+                if k:
+                    k = kuerzel_aliases.get(k, k)
+                    if k not in kuerzel_order:
+                        kuerzel_order.append(k)
+                else:
+                    counters["novel_form"] += 1
+                    log_vocab_novelty(rec.drucksache_antwort_nr or "", "ministerium_form", form)
 
         rec.beteiligte_ministerien_kuerzel = ",".join(kuerzel_order)
         rec.beteiligte_ministerien = len(kuerzel_order)
@@ -2159,6 +2562,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     md_kanr_mismatch: list[str] = []  # md text does NOT contain "Kleine Anfrage <Nr>"
     md_grosse_anfrage: list[str] = []  # md text is a Große Anfrage answer
     bad_nr: list[str] = []
+    negative_response_time: list[str] = []  # Antwortdatum strictly before Anfragedatum
     novel_min: dict[str, int] = {}
     novel_frak: dict[str, int] = {}
     by_wp_ka: dict[int, set[int]] = {}            # for KA gap detection
@@ -2190,6 +2594,16 @@ def cmd_verify(args: argparse.Namespace) -> int:
                             md_grosse_anfrage.append(f"{key} (KA {rec.kleine_anfrage_nr})")
         if rec.drucksache_antwort_nr and not re.match(r"\d+/\d+$", rec.drucksache_antwort_nr):
             bad_nr.append(f"{key}: drucksache_antwort_nr={rec.drucksache_antwort_nr!r}")
+        if rec.anfragedatum and rec.antwortdatum:
+            try:
+                ad = date.fromisoformat(rec.anfragedatum)
+                rd = date.fromisoformat(rec.antwortdatum)
+                if rd < ad:
+                    negative_response_time.append(
+                        f"{key}: {rec.anfragedatum} → {rec.antwortdatum} ({(rd - ad).days}d)"
+                    )
+            except ValueError:
+                pass
         if rec.fraktion and not check_fraktion(rec.fraktion):
             novel_frak[rec.fraktion] = novel_frak.get(rec.fraktion, 0) + 1
         if rec.wp and rec.kleine_anfrage_nr:
@@ -2244,6 +2658,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"malformed Drucksache_*_Nr: {len(bad_nr)}")
     for k in bad_nr[:10]:
         print(f"  {k}")
+    print(f"negative Antwortzeit (Antwortdatum vor Anfragedatum): {len(negative_response_time)}")
+    for k in negative_response_time[:10]:
+        print(f"  {k}")
     print(f"orphan PDFs in Archiv (no matching row): {len(orphans)}")
     for k in orphans[:10]:
         print(f"  {k}")
@@ -2267,7 +2684,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"  {n:4d}× {v!r}")
 
     # Hard-fail categories
-    bad = len(md_missing) + len(md_short) + len(bad_nr) + len(md_kanr_mismatch) + len(dup_lines)
+    bad = (len(md_missing) + len(md_short) + len(bad_nr) + len(md_kanr_mismatch)
+           + len(dup_lines) + len(negative_response_time))
     if bad:
         print(f"\nverify: {bad} broken row(s); exit non-zero", file=sys.stderr)
         return 1
@@ -2312,6 +2730,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="parse Antworttext-MD for ALL beteiligte Ministerien (Beteiligte_Ministerien_Kuerzel)")
     s.add_argument("--wahlperiode", type=int)
     s.set_defaults(func=cmd_extract_multi_ministerium)
+
+    s = sub.add_parser("build-abgeordnete-index",
+                       help="build Index/abgeordnete.xlsx from data/index.xlsx Anfrager column")
+    s.set_defaults(func=cmd_build_abgeordnete_index)
+
+    s = sub.add_parser("extract-all-anfrager",
+                       help="parse Antwort-PDF Anfragerblock for FULL co-signer list "
+                            "(Anfrager_Alle, Anzahl_Abgeordnete) — fixes DB cap of 2 + 'u.a.'")
+    s.add_argument("--wahlperiode", type=int)
+    s.set_defaults(func=cmd_extract_all_anfrager)
 
     s = sub.add_parser("enrich-llm",
                        help="LLM rescue for rows the rule-based parser left flagged in Extract_Flags")

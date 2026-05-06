@@ -34,7 +34,6 @@ data/index.xlsx.bak.*
 skill-revision.md
 tools/
 data/db_index.xlsx
-data/index_fixed.xlsx
 
 # editors
 .vscode/

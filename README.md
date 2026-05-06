@@ -41,11 +41,28 @@ Diese kleineren Probleme sind aufgefallen:
 - Es wird immer nur das federführende Ministerium genannt, keine weiteren, die an der Antwort beteiligt waren (Spalte `Beteiligte_Ministerien_Kuerzel` ergänzt das aus den PDFs).
 - In mindestens zwei Fällen stehen in der Datenbank Links auf Dokumente, die es doppelt gibt - unter unterschiedlichen Dokumentnummern.
 
+All dies konnte der Agent selbsttätig auflösen.
+
+## Der eine Eingriff von Hand...
+
+...betrifft einen AfD-Abgeordneten, der in der 18. Wahlperiode die AfD verlassen hat und als Fraktionsloser drei Anfragen stellte. Er trat der Fraktion danach wieder bei. In der Datei `index_fixed.xlsx` sind diese drei Anfragen auf die AfD umgeschlüsselt - ansonsten ist sie ein getreues Abbild der `index.xlsx`.
+
+
+## Der Python-Code
+
+...steckt praktisch vollständig in `landtag.py`, einem Kommandozeilen-Tool, mit dem man die Daten aus der Datenbank ziehen und aus PDFs extrahieren kann. Er automatisiert die Suche in den PDFs nach Datum, beteiligten Ministerien, und Volltext.
+
+**Das Tool ist weniger für den Einsatz durch den/die Datenjourno als zum Einsatz für die KI.** Natürlich kann man das Tool auch auf der Kommandozeile aufrufen - die Befehle finden sich in SKILL.md - aber viel einfacher ist, den Agenten das Tool selbst nutzen zu lassen: im starren Python-Code werden immer wieder Ergebnisse produziert, die man sich anschauen muss. Die KI kann das erledigen - und die häufigen Fehler selbst abräumen: Tippfehler, Zahlendreher, Verwechslungen.
+
+Am Ende einer Session steht dann eine vollständige Index-Tabelle - mit Links auf die Primärquellen zur weiteren Auswertung z.B. auf Anfrage- oder Antworttexte hin.
+
 ## Auswertung in R
 
 Im Ordner `R` findet sich das Skript für die Auswertung der Tabelle. Es nimmt die `data/index.xlsx` und pivotiert/summiert auf - erzeugt für beide Wahlperioden 17 und 18 jeweils eine Reihe von Kreuztabellen, die Anzahl und Bearbeitungszeit der Anfragen aufgeschlüsselt nach Fraktionen, Ministerien, Abgeordneten. Außerdem werden die Themen-Tags aus der Rubrik "Systematik" ausgewertet - über den gesamten Zeitraum hinweg werden Tabellen mit den meist verwendeten Tags erzeugt.
 
 Diese Tabellen können dann z.B. mit Datawrapper visualisiert werden.
+
+Die Tabellen werden ins Verzeichnis `data/` geschrieben, in Unterverzeichnisse für die jeweilige Wahlperiode, soweit zutreffend.
 
 ## Wichtige Dateien
 

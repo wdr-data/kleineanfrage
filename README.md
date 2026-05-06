@@ -4,12 +4,20 @@ Strukturierte Daten zu **Kleinen Anfragen** des Landtags Nordrhein-Westfalen lok
 
 Wer hat wann was gefragt - und welches Ministerium hat wie schnell geantwortet? Die Daten aus der Datenbank - und die Verweise auf die Volltexte - landen in einer Excel-Tabelle (`data/index.xlsx`), die eine weitere Auswertung erlaubt.
 
-## Setup
+In diesem Repository findet sich:
 
-```sh
-pip install -r requirements.txt
-brew install poppler          # liefert pdftotext (auf macOS)
-```
+- Ein Tool-Skript, um Daten aus der Datenbank zu lesen und aus den PDFs zu extrahieren
+- Ein "Skill", mit der ein KI-Agent dieses Tool für die Userin benutzen kann
+- Ein R-Skript zur Auswertung der gefundenen Daten
+
+## Was ein Skill ist
+
+Ein "Skill" ist ein Paket für einen KI-Agenten wie Claude Code, mit dem er eine Aufgabe lösen können soll:
+
+- **Werkzeuge**, die die KI einsetzen kann, um die Aufgabe zu lösen
+- **prozedurales und Hintergrundwissen** - gewissermaßen die Betriebsanleitung zu den Tools.
+
+Einen Skill kann man zu Beginn einer Claude-Code-Session wie ein Zusatzmodul laden - es ist im Prinzip eine Art langer System Prompt, der das Sprachmodell auf seine Aufgabe vorbereitet. In unserem Fall: saubere Daten über Kleine Anfragen in NRW gewinnen.
 
 ## Wie man den Skill benutzt
 
@@ -36,6 +44,8 @@ Diese kleineren Probleme sind aufgefallen:
 ## Auswertung in R
 
 Im Ordner `R` findet sich das Skript für die Auswertung der Tabelle. Es nimmt die `data/index.xlsx` und pivotiert/summiert auf - erzeugt für beide Wahlperioden 17 und 18 jeweils eine Reihe von Kreuztabellen, die Anzahl und Bearbeitungszeit der Anfragen aufgeschlüsselt nach Fraktionen, Ministerien, Abgeordneten. Außerdem werden die Themen-Tags aus der Rubrik "Systematik" ausgewertet - über den gesamten Zeitraum hinweg werden Tabellen mit den meist verwendeten Tags erzeugt.
+
+Diese Tabellen können dann z.B. mit Datawrapper visualisiert werden.
 
 ## Wichtige Dateien
 

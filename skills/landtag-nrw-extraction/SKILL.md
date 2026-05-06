@@ -5,162 +5,125 @@ description: Use when extracting or querying Kleine Anfrage data from Landtag NR
 
 # Landtag NRW — Kleine Anfrage extraction
 
-Idempotente CLI-Verben in `landtag.py`, alle wrappen ein gemeinsames `data/index.xlsx` und einen `.md`-Cache neben den Original-PDFs in `Archiv/`. Stammdaten-Tabellen liegen in `Index/` (Fraktionen, Ministerien, Abgeordnete).
+Idempotente CLI-Verben in `landtag.py` über drei Datenebenen:
 
-`crawl` schreibt zusätzlich einen reinen DB-Snapshot nach `data/db_index.xlsx` — nur die Felder aus der Landtag-Suche, ohne PDF-Anreicherung. Diese Datei ist die immutable Single-Source-of-Truth für die DB-Sicht (nie von Hand editieren, nie von anderen Verben überschrieben).
+- `data/db_index.xlsx` — **immutable DB-Snapshot** der Landtag-Suche, geschrieben nur von `crawl`. Single Source of Truth für die DB-Sicht. Nie von Hand editieren.
+- `data/index.xlsx` — **Working-File** mit DB-Werten + PDF-Anreicherungen + Qualitäts-Spalten. Wird durch die Pipeline-Verben gepflegt.
+- `Archiv/.../MMD<wp>-<nr>.{pdf,md}` — Original-PDFs + pdftotext-Cache.
+
+Stammdaten-Tabellen liegen in `Index/` (Fraktionen, Ministerien, Abgeordnete) — siehe `vocabulary.md`.
+
+`merge` materialisiert den DB↔PDF-Cross-Check pro Zeile in drei Spalten:
+- `Mismatch_Flags` — `","`-getrennte Liste der Felder, in denen DB und PDF widersprechen (`anfragedatum`, `antwortdatum`, `drucksache_anfrage_nr`, `fraktion`, `md_kanr`).
+- `Datenqualität` — `ok` / `korrigiert` (manueller Tag oder nicht-leere `Notizen`) / `ask_review` (offener Mismatch ohne Notiz).
+- `Notizen` — Free-Text, Domain des `resolve`-Verbs. Sobald non-empty, bleibt die Zeile bei späteren `merge`-Läufen `korrigiert` (nicht-rückgängige Triage).
+
+**Datums-Toleranz** (in `_date_mismatch`): `anfragedatum`/`antwortdatum`-Diffs in PDF-früher-Richtung 0–122d sind kein Mismatch (DB = Drucksachen-Datum, PDF = Brief-/Schreibdatum — typischer Verarbeitungs-Lag). Geflaggt: Diff > 122d, DB-früher > 14d, Jahres-Tippfehler (~365d), OCR-Glitch (Jahr außerhalb [2015, 2030]).
+
+**pdftotext-Quirks** im Header-Parser (`_parse_pdf_header_fields`): Spacing-tolerant (`"Anfrage 5vom"`, `"Drucksache17/32"`) und Doubled-Character-Render (`"LLAANNDDTTAAGG …"` → automatischer Dedouble via `_maybe_dedouble`).
+
+`Antworttext_Status` kennt zusätzlich `pdf_missing` (manuell im `resolve`-Schritt gesetzt) — Landtag-CDN liefert unter der DS-Nr ein anderes Dokument (typischerweise die zugehörige Anfrage statt der Antwort, oder ein Routing-Bug zwischen ähnlichen DS-Nrs). `fetch-text` überspringt diese Zeilen, bis `--force` gesetzt wird.
 
 ## When to use
 
-- Frage nach **Wer/Was/Wann** einer Kleinen Anfrage (Anfrager, Fraktion, Datum, Ministerium, Schlagworte) → `data/index.xlsx` abfragen.
-- Frage nach **allen Mit-Anfragenden** (auch jenseits der ersten 2) → Spalte `Anfrager_Alle` (siehe „Anfrager-Vollständigkeit"). DB-Spalte `Anfrager` ist auf 2 Namen + `u.a.` gekappt.
-- Frage nach **allen beteiligten Ministerien** → Spalte `Beteiligte_Ministerien_Kuerzel`. Search-Hit nennt nur das federführende Ressort.
-- Frage nach **Inhalt einer konkreten Antwort** → `Archiv/.../MMD18-N.md`. Fall back auf PDF nur wenn `.md` fehlt.
-- **Quantitative Auswertung** über den Datenbestand → mit pandas auf der XLSX.
-- Wunsch nach **frischen Daten** → Refresh-Loop (siehe unten).
-- **Zweifel an einer einzelnen Zeile** → Nachrecherche-Strategie (siehe unten).
+- Frage nach **Wer/Was/Wann** einer Kleinen Anfrage → `data/index.xlsx` abfragen.
+- Frage nach **allen Mit-Anfragenden** → Spalte `Anfrager_Alle` (DB-Spalte `Anfrager` ist auf 2 Namen + `u.a.` gekappt).
+- Frage nach **allen beteiligten Ministerien** → Spalte `Beteiligte_Ministerien_Kuerzel` (Search-Hit nennt nur das federführende Ressort).
+- Frage nach **Inhalt einer konkreten Antwort** → `Archiv/.../MMD<wp>-<nr>.md`.
+- **Quantitative Auswertung** → mit pandas auf der XLSX (siehe „Read access" unten).
+- Wunsch nach **frischen Daten** → Refresh-Loop unten.
+- **Zweifel an einer einzelnen Zeile** → `Datenqualität=ask_review` filtern, dann `resolve --auto` (Heuristik), gezielter `resolve --ka N`, oder im Restfall `resolve --interactive`.
 
-## First-time setup & full refresh
-
-`crawl` ist Canon — die Online-Suche bestimmt, welche KAs der Wahlperiode existieren. Reihenfolge (jeder Verb idempotent):
+## Pipeline
 
 ```sh
-python landtag.py crawl                       --wahlperiode 18  # discovery + enrich aus Search (~25 min)
-python landtag.py fetch-text                  --wahlperiode 18  # lädt fehlende Antwort-PDFs, schreibt .md
-python landtag.py scan-archive                --wahlperiode 18  # reichert Anfragetitel + Min-Prosaname an
-python landtag.py extract-multi-ministerium                     # parst Antworttext-MD nach allen beteiligten Ressorts
-python landtag.py build-abgeordnete-index                       # baut Index/abgeordnete.xlsx aus DB-Anfrager-Spalte
-python landtag.py extract-all-anfrager                          # füllt Anfrager_Alle + Anzahl_Abgeordnete aus Antwort-PDF
-python landtag.py build-abgeordnete-index                       # 2. Pass: absorbiert Namen, die nur in u.a.-PDFs auftauchten
-python landtag.py extract-all-anfrager                          # 2. Pass: matcht jetzt auch diese Namen
-python landtag.py verify                                        # sanity report
+python landtag.py crawl                     --wahlperiode 18  # discovery + DB-Snapshot (~25 min)
+python landtag.py fetch-text                --wahlperiode 18  # lädt fehlende Antwort-PDFs, schreibt .md
+python landtag.py scan-archive              --wahlperiode 18  # reichert Anfragetitel + Min-Prosaname
+python landtag.py extract-multi-ministerium                   # alle beteiligten Ressorts
+python landtag.py build-abgeordnete-index                     # Index/abgeordnete.xlsx aus DB-Anfrager
+python landtag.py extract-all-anfrager                        # Anfrager_Alle + Anzahl_Abgeordnete
+python landtag.py build-abgeordnete-index                     # 2. Pass: absorbiert 3.+ Anfrager
+python landtag.py extract-all-anfrager                        # 2. Pass: matcht erweiterten Namensindex
+python landtag.py merge                                       # Mismatch_Flags + Datenqualität
+python landtag.py resolve --auto                              # Heuristik-Auflösung der ask_review-Zeilen
+python landtag.py verify                                      # sanity report
 ```
 
-`crawl` zieht aus dem Search-Index für jede KA: beide Drucksachen (Anfrage+Antwort) mit Links + Anfragedatum, Antwortdatum, Anfrager, Fraktion, Titel, Systematik, Schlagworte UND das antwortende Ministerium-Kürzel direkt. **Vorsicht:** Der Search-Hit liefert für `Anfrager` nur die ersten **2** Mit-Anfragenden plus `u.a.`, wenn 3+ Abgeordnete eine KA gemeinsam einreichen. Die volle Liste steht im Antwort-PDF und wird über `build-abgeordnete-index` + `extract-all-anfrager` in die Spalten `Anfrager_Alle` / `Anzahl_Abgeordnete` geschrieben (siehe „Anfrager-Vollständigkeit"). Auch das im Search-Hit genannte Ministerium-Kürzel ist nur das **federführende**; zusätzlich beteiligte Ressorts werden über `extract-multi-ministerium` aus dem PDF-Boundary-Absatz nachgezogen (Spalte `Beteiligte_Ministerien_Kuerzel`). `scan-archive` läuft im Default als **enrich-only** und überschreibt nie Crawl-Werte (`--allow-discovery` für legacy / standalone).
+`crawl` liefert pro KA: beide Drucksachen + Links, Anfragedatum, Antwortdatum, Anfrager (max 2 + `u.a.`), Fraktion, Titel, Systematik, Schlagworte, federführendes Ministerium-Kürzel. Alles weitere kommt aus dem Antwort-PDF.
 
-`normalize` (Fraktion/Ministerium → canonical) wird automatisch am Ende von `crawl` und `fetch-text` aufgerufen; `enrich-llm` ist optional für Rest-Lücken.
+`normalize` (Fraktion/Ministerium → kanonisch) wird automatisch am Ende von `crawl` und `fetch-text` aufgerufen. `enrich-llm` ist optional für Rest-Lücken.
 
-Mehrere Wahlperioden in derselben `index.xlsx` sind unterstützt — jede Zeile trägt ihre `WP`. Z. B. WP17 ergänzen:
-
-```sh
-python landtag.py crawl --wahlperiode 17    # legt WP17-Zeilen an
-python landtag.py fetch-text --wahlperiode 17
-python landtag.py scan-archive --wahlperiode 17
-python landtag.py build-abgeordnete-index   # Index/abgeordnete.xlsx hält WP17 + WP18 nebeneinander
-python landtag.py extract-all-anfrager --wahlperiode 17
-```
-
-`Index/abgeordnete.xlsx` enthält jeweils eine Zeile pro (`WP`, `Fraktion`, `Person`) — Wahlperioden-übergreifend. `extract-all-anfrager --wahlperiode 17` matcht dabei nur gegen die WP17-Einträge (jede WP hat eigene Abgeordnete).
-
-Date-bounded subset (filter is client-side, applied after fetch):
+Mehrere Wahlperioden in derselben `index.xlsx` möglich — jede Zeile trägt ihre `WP`. Date-bounded subset (client-side):
 
 ```sh
 python landtag.py crawl --wahlperiode 18 --from 2024-01-01 --to 2024-12-31
 ```
 
-## Anfrager-Vollständigkeit (Spalten `Anfrager_Alle`, `Anzahl_Abgeordnete`)
+## Resolve-Pipeline für `ask_review`-Zeilen
 
-**Bug:** Die Suchergebnisseite des Landtags listet pro KA maximal 2 Anfragende, danach `u.a.` (~1.400 Zeilen sind betroffen). Die Antwort-PDF (Header) führt aber alle Mit-Anfragenden auf. Der Workflow gleicht das gegen einen lokalen Abgeordneten-Index ab.
+Nach `merge` zeigt `Datenqualität=ask_review`, welche Zeilen ungeklärte DB↔PDF-Mismatches haben. Reihenfolge:
 
 ```sh
-python landtag.py build-abgeordnete-index   # → Index/abgeordnete.xlsx
-python landtag.py extract-all-anfrager      # füllt Anfrager_Alle, Anzahl_Abgeordnete
-python landtag.py build-abgeordnete-index   # Bootstrap-Pass 2 (siehe unten)
-python landtag.py extract-all-anfrager
+python landtag.py resolve --auto                              # Stage 1
+python landtag.py resolve --ka 144 --counter-search           # Stage 2 (gezielt)
+python landtag.py enrich-llm                                  # Stage 3 (Rest-Lücken)
+# Stage 4: Web-Recherche pro Zeile, Stage 5: resolve --interactive — siehe unten
 ```
 
-`build-abgeordnete-index` aggregiert alle (`WP`, `Fraktion`, `Nachname`, `Vorname`)-Tupel, die in der DB-Spalte `Anfrager` auftauchen. Da die Datenbank nur die ersten 2 Anfragenden je KA liefert, fehlen ggf. Personen, die ausschließlich als 3.+ Mit-Anfragende auftauchen — nach dem ersten `extract-all-anfrager`-Lauf stehen diese aber bereits in `Anfrager_Alle`, deshalb der **zweite Build+Extract-Pass**: er absorbiert diese Namen und matcht in der Folge auch KAs, die zuvor mit Residue-Eintrag im Log endeten.
+1. **`resolve --auto`** — Heuristik-Pass über alle ask_review-Zeilen. Klassifiziert bekannte Mismatch-Muster (PDF-OCR-Glitch, Drucksachen-vs-Brief-Datum, Fraktionsaustritt, DS-Nr-Tippfehler, pdftotext-Spacing-Glitch …) und setzt `Datenqualität=korrigiert` mit erklärender Notiz. Idempotent; `--dry-run` für Trockenlauf. Schließt typischerweise 90 %+ der ask_review-Zeilen. Heuristiken siehe Tabelle unten.
+2. **`resolve --ka N [--counter-search] [--delete-phantom]`** — Live-DB-Re-Fetch für eine konkrete KA-Nr. Use cases: Phantom-Zeile, md↔KA-Nr-Diff > Heuristik-Korridor, Korrigendum auf Landtag-Seite, oder Verdacht auf stale `db_index.xlsx`-Snapshot.
+3. **`enrich-llm`** — LLM-Rescue für Rest-Lücken in `Extract_Flags` (nicht primärer Resolve-Pfad, aber hilft bei Anfrager-/Ministerium-Lücken).
+4. **Web-Recherche** — Agent recherchiert via Web-Tools (Landtag-Suche live, offizielle MdL-Liste). Notizen-Konvention: `Quelle: <URL> — DB-Wert bestätigt / korrigiert auf <Wert>.` (filterbar via `Notizen.str.contains("Quelle:")`).
+5. **`resolve --interactive`** — Human-Dialog für die letzten unklaren Zeilen. Pro Zeile: DB↔PDF anzeigen, Notiz + Verdict erfragen. Resume-safe. **Stdin-Pipe ist fragil** (bedingter Verdict-Prompt — leere Notiz = kein Verdict-Read; nicht-leere Notiz = zusätzlicher Read); für Batch-Prozessierung lieber `--auto` oder `openpyxl`-Direkt-Write nutzen.
 
-**Offizielle Quelle ergänzen** — der Landtag NRW veröffentlicht eine vollständige Liste der aktuellen Abgeordneten unter <https://www.landtag.nrw.de/home/der-landtag/abgeordnete-und--fraktionen/die-abgeordneten/abgeordnetensuche/liste-aller-abgeordneten.html>. Die Bootstrap-Aggregation aus DB-Anfragern erfasst nur Personen, die mindestens einmal als 1./2. Anfrager (oder schon im 2. Pass als 3.+) auftauchen — Hinterbänkler*innen, die nur sehr selten oder gar nicht KAs mitzeichnen, fehlen. Vor dem ersten Lauf einer neuen WP daher idealerweise diese Liste scrapen und als zusätzliche Datenquelle in `Index/abgeordnete.xlsx` einspielen (separates One-shot-Skript, noch nicht implementiert; bis dahin bleibt der DB-only-Bootstrap das Default-Verhalten).
+### Heuristik-Tabelle (DB↔PDF, wer hat recht)
 
-**Format-Konvention:**
-- DB / `Anfrager` / `Anfrager_Alle`: `Nachname, Vorname` (mehrere `; `-getrennt). Titel (`Dr.`, `Prof. Dr.`) bleiben am Anfang des `Nachname`-Teils.
-- Antwort-PDF-Header: `Vorname Nachname` (Komma-Liste, letzter mit `und`). Titel werden vor den Vornamen gestellt. Der Konverter `db_to_pdf_form` erzeugt aus DB-Form die PDF-Form; `db_to_pdf_form_aliases` zusätzlich vereinfachte Varianten (Mittelinitial weg, Hyphen-Mittelnamen weg, Titel weg) — nötig, weil PDFs oft kürzere Schreibweisen verwenden („Sven W. Tritschler" → „Sven Tritschler").
+`resolve --auto` implementiert exakt diese Tabelle (`_classify_mismatch` in `landtag.py`).
 
-**Edge-Case Fraktionswechsel:** Verlässt eine Person ihre Fraktion mitten in der WP (z. B. Pretzell, Neppe, Müller-Witt), erscheint sie in der DB unter beiden Fraktionen. Der Index trägt dann je eine Zeile pro (WP, Fraktion, Person); die Spalte `Frueher_Fraktion` listet alle anderen Fraktionen, unter denen dieselbe Person in derselben WP geführt wird — als Doku und als Fallback-Hinweis bei Match-Misserfolgen.
-
-**Residue-Log:** Was der Parser im PDF-Anfragerblock nicht zuordnen kann, landet in `data/anfrager_novelty.log` (Format: Drucksache | Fraktion | residue | block). Vor manueller Korrektur prüfen, ob ein dritter Bootstrap-Pass oder ein Eintrag aus der offiziellen MdL-Liste das Problem löst.
-
-### Plausi-Check + Edge-Case-Nachrecherche durch den Agenten
-
-`extract-all-anfrager` vergleicht am Ende jeder Zeile die **geparste Anzahl** mit der **Mindesterwartung aus der DB-Anfrager-Spalte** (1 oder 2 Namen, oder ≥3 wenn `u.a.` markiert). Liegt die Parser-Zahl darunter → Eintrag ins Mismatch-Log:
-
-```
-… | 17/172 | GRÜNE | MISMATCH parsed=0 db_min=1 | db_anfrager="Schäffer, Verena" | block="…"
-```
-
-Am Ende eines Laufs steht zusätzlich `plausi_mismatch=N` in der Status-Zeile. Diese Fälle **soll der Skript nicht selbst zu reparieren versuchen** — sie sind Edge-Cases, die ein Agent gezielt durchgeht. Workflow:
-
-1. **Fälle holen:** `grep MISMATCH data/anfrager_novelty.log` (oder gefiltert nach `parsed=0`, einer KA-Nr usw.).
-2. **Antwort-PDF lesen:** `df.loc[df.Drucksache_Antwort_Nr == "X/Y", "Antworttext"]` → `.md` öffnen, ersten Bildschirm anschauen — der Anfragerblock steht direkt unter „Antwort der Landesregierung auf die Kleine Anfrage … vom …".
-3. **Fehlerursache identifizieren** (siehe Tabelle unten) und entweder: 
-   - **direkt korrigieren**: `Anfrager_Alle` und `Anzahl_Abgeordnete` für die Zeile manuell setzen (z. B. via `openpyxl` oder kurzer Python-Patch). Originalspalte `Anfrager` unangetastet lassen.
-   - oder **als ungeklärt markieren**: füge ein Token wie `anfrager_unverified` zur Spalte `Extract_Flags` der Zeile (komma-separiert), damit Auswertungen die Zeile ausschließen können.
-
-Bekannte Edge-Case-Quellen (PDF-Header → Wirklichkeit):
-
-| PDF-Symptom | Bedeutung | Schnell-Korrektur |
+| Mismatch | Heuristik | Verdict |
 |---|---|---|
-| `der AbgeordnetenVorname Nachname` (kein Leerzeichen) | pdftotext-Whitespace-Loss am Wortende | bereits regex-toleriert |
-| `VornameNachname` / `undVorname` | Whitespace-Loss innerhalb / vor Name | bereits via Lower-Upper-Heuristik gefixt; Reste manuell |
-| `Volker Baran` statt `Volkan Baran`, `Anrdt Klocke` statt `Arndt`, `Sarah Philip` statt `Philipp` | echter Buchstaben-Tippfehler im PDF | manuell den DB-Namen setzen |
-| `Markus Pretzell` (PDF) vs. `Marcus Pretzell` (DB) | unterschiedliche Schreibweise | manuell gegen offizielle MdL-Liste prüfen, dominante Form übernehmen |
-| 2 `der Abgeordneten`-Blöcke, einer pro Fraktion (z. B. `Nic Vogel AfD` + `und Frank Neppe FRAKTIONSLOS`) | Cross-Fraktion-Co-Signer (selten, aber legitim) | beide Namen manuell zusammenführen; Fraktion der Zeile = Fraktion der Anfrage-stellenden Mehrheit |
-| Block leer / `Antwort: Unterrichtung Präs` | Anfrage zurückgezogen | erwartet — Status `anfrage_zurueckgezogen`; kein Mismatch-Eintrag nötig |
-| DB-Anfrager enthält Komma + Fraktion-Token (`Lisa-Kristin SPD , Dr. Pfeil, Werner`) | Crawl-Fehler weiter oben | siehe `verify` / `resolve` — mit `--counter-search` gegenprüfen, bei Bedarf Zeile mit `resolve` neu ziehen |
+| `antwortdatum` Diff 0–122d, beide Jahre 2015–2026 | DB = Drucksachen-/Veröff.-Datum, PDF = Briefdatum „mit Schreiben vom …" | beide legitim, Notiz „Diff Nd; …" |
+| `antwortdatum` Diff ~365d, gleiches MM/DD | Jahres-Tippfehler im PDF | DB maßgeblich |
+| `antwortdatum` Jahr außerhalb [2015,2026] | pdftotext-OCR-Glitch | DB maßgeblich |
+| `anfragedatum` Diff 0–122d (DB ≥ PDF) | DB = Drucksachen-Datum, PDF = Datum auf Anfrage-Schreiben | beide legitim |
+| `anfragedatum` Diff ~365d / Jahr außerhalb Bereich | Tippfehler / OCR-Glitch | DB maßgeblich |
+| `drucksache_anfrage_nr` PDF-Wert = KA-Nr | PDF-Parser fing falsche Drucksache-Zeile | DB maßgeblich |
+| `drucksache_anfrage_nr` PDF = `<WP>/<WP>` (z. B. `17/17`) | False-Positive auf Wahlperiode-Header | DB maßgeblich |
+| `drucksache_anfrage_nr` Diff Off-by-1/10/100/1000 oder zusätzliche/fehlende Ziffer | OCR-Digit-Tippfehler im PDF | DB maßgeblich |
+| `drucksache_anfrage_nr` PDF-WP ≠ DB-WP | PDF-Parser fing falschen Header | DB maßgeblich |
+| `fraktion` AfD ↔ fraktionslos | Fraktionsaustritt zwischen Anfrage und Antwort (Pretzell, Vogel/Neppe/Langguth Herbst 2017) | beide legitim |
+| `fraktion` PDF zeigt andere Partei als Anfrager | Landtag-PDF-Header-Tippfehler oder Multi-Fraktions-Anfrage | DB = Fraktion der Anfrager:innen maßgeblich |
+| `md_kanr`, PDF-Parser-Output komplett leer, .md enthält literal `Anfrage <KA>vom` | pdftotext-Spacing-Glitch | DB+PDF konsistent, Mismatch-Flag = Parser-Artefakt |
+| `md_kanr`, .md enthält jedes Zeichen doppelt (`LLAANNDDTTAAGG`) | pdftotext-Render-Quirk bei bestimmten Schrift-Embeddings | Parser-Artefakt, DB maßgeblich |
+| `md_kanr`, .md-KA-Nr passt zu *anderer* Drucksache | Landtag-PDF-Body nennt fremde KA-Nr (Doppelvergabe / Druckfehler) | DB-Snapshot maßgeblich |
+| .md-Inhalt ist die Anfrage statt der Antwort | Landtag-CDN-Routing-Bug — Antwort-PDF effektiv nicht verfügbar | `Antworttext_Status=pdf_missing`, `Antworttext` leeren, Notiz |
 
-**Markieren statt fixen:** Wenn Zweifel bestehen, lieber ein `Extract_Flags`-Token setzen (z. B. `anfrager_unverified`, `anfrager_pdf_typo`) als raten. Auswertungen können dann gezielt filtern. Die Mismatch-Logs sind das Inventar — Ziel ist nicht 100% automatischer Match, sondern transparent dokumentierter Restbestand.
-
-**Re-Run-Schutz:** Nach einer manuellen Korrektur den Token `anfrager_manual` zu `Extract_Flags` hinzufügen. `extract-all-anfrager` skipt solche Zeilen — die Korrektur überlebt damit jeden Re-Run der Pipeline.
-
-**Bulk-Remediation:** `tools/fix_anfrager_mismatches.py` arbeitet das aktuelle Mismatch-Log batch-mäßig ab — versucht (a) erweiterte Whitespace-Heuristik, (b) Cross-Fraktion-Matching und (c) DB-Fallback (DB-Werte übernehmen, wenn DB ohne `u.a.` ist). Setzt `anfrager_manual` (+ ggf. `anfrager_from_db`, `anfrager_cross_fraktion`) bei Erfolg, sonst `anfrager_unverified`. Idempotent — überspringt bereits behandelte Zeilen.
-
-## Nachrecherche-Strategie (für einzelne Zweifelsfälle)
-
-`verify` listet Verdachtsfälle (md ↔ KA-Nr-Mismatch, Lücken, Duplikate). Reparatur in der Regel über das `resolve`-Verb:
+Gezielte Direkt-Reparatur einzelner KAs (Phantom, md↔KA-Mismatch, Korrigendum):
 
 ```sh
-# Eine oder mehrere KA-Nrn frisch von der Live-Suche holen, stale Phantom-Zeilen löschen:
 python landtag.py resolve --ka 144 --ka 3167 --counter-search --delete-phantom
 ```
 
-`--counter-search`: bei 0 KA-Treffern wird mit `doktyp=GA` (Große Anfrage) nachgeschaut — wenn dort gefunden, ist die fragliche Zeile ein Out-of-Scope-Phantom. `--delete-phantom`: löscht sowohl GA-Phantome als auch stale Zeilen (gleiche KA-Nr, aber andere Antwort-Drucksache als der Live-Treffer).
-
-Manuelle Direktsuche im Browser (falls man's selbst sehen will):
-```
-https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten-suchergeb.html?nummer=<N>&doktyp=KA&wp=18
-```
-
-Das `verify`-Verb liefert in seinem Report:
-- **md ↔ KA-Nr-Mismatch**: Antwort-PDF erwähnt eine andere KA-Nr als der Index — meist ein Crawl-Fehlmatch oder ein kaputtes PDF (pdftotext rendert manche Files mit Doppel-Buchstaben).
-- **KA-Nr Lücken**: KAs sind fortlaufend nummeriert. Lücken sind entweder zurückgezogen (`anfrage_zurueckgezogen`) oder noch unveröffentlicht.
-- **Duplikat-KA-Nr**: gleiche KA-Nr in mehreren Zeilen. Häufig **legitim** (Korrigenda / Nachgang); rarely a Parser-Bug.
-- **negative Antwortzeit**: Antwortdatum strikt vor Anfragedatum. Selten — entweder Tippfehler im PDF (z. B. Anfragedatum mit falschem Jahr), Crawl-Fehlmatch oder vertauschte Datumsspalten. 0-Tage-Antworten (gleicher Tag) sind nicht beanstandet, weil legitim möglich (z. B. dringliche Anfragen).
-
-### Bekannte Sonderfälle
-
-- **`Antwort: Unterrichtung Präs`** im Search-Hit → Anfrage wurde zurückgezogen; das „Antwort"-Dokument ist eine Unterrichtung des Landtagspräsidenten. Wird automatisch mit Status `anfrage_zurueckgezogen` markiert (siehe `parse_search_hits`); `Antwortdatum` = Datum der Unterrichtung. Skipt in `fetch-text`/`scan-archive`.
-- **`MCdS`** (Minister + Chef der Staatskanzlei) ist dasselbe Ministerium wie **`MBEIM`** (gleiche Person, andere Rolle). Bereits via `Aliases`-Spalte in `Index/ministerien.xlsx` zusammengeführt.
-- **`MKJFGF` vs. `MKJFGFI`**: Familienministerium (Kinder, Jugend, Familie, Gleichstellung, Flucht und Integration). Korrektes Kürzel ist `MKJFGFI`; alte Schreibweise `MKJFGF` ist als Alias gelistet.
-- **Mehrere beteiligte Ministerien:** Antwort-PDFs haben nach dem Anfragetext einen Absatz „Der Minister … / Die Ministerin …" der ggf. mehrere Ressorts nennt (z. B. KA 4338: Familienministerium hat Rücksprache mit Innenministerium gehalten). Dieser Absatz ist die autoritative Quelle für **alle** beteiligten Ministerien — der Search-Hit nennt nur das federführende. Extraktion via `landtag.py extract-multi-ministerium` → schreibt comma-separierte Kürzel-Sets nach `Beteiligte_Ministerien_Kuerzel` (federführend zuerst). WP18 abgedeckt; WP17 hat anderen Ministeriumszuschnitt und ist out of scope.
-- **Anfrage-PDFs im `Archiv/`** sehen auf Seite 1 fast identisch aus wie die Antworten und werden seit dem Anfrage-PDF-Filter sauber ausgesondert.
-- **Antworten auf Große Anfragen** liegen z.T. mit im `Archiv/` und werden über den GA-Filter ausgesondert.
-- **Wahlperioden-Wechsel** ändern Ministeriumszuschnitt (WP17 = Schwarz-Gelb, WP18 = Schwarz-Grün). Neue Kürzel landen in `data/vocab_novelty.log` — vor automatischem Mergen prüfen.
+Edge-Case-Pattern und Tippfehler-Tabelle: siehe `edge-cases.md`. Schreibvarianten und Aliase: siehe `vocabulary.md`.
 
 ## Read access
 
 ```python
 import pandas as pd
 df = pd.read_excel("data/index.xlsx")
-df[df.Fraktion == "AfD"]                                              # by Fraktion
-df[df.Anfrager_Alle.str.contains("Wagner", na=False)]                 # by Abgeordnete (FULL list)
-df[df.Schlagworte.str.contains("Polizei", na=False)]                  # by Schlagwort
-df[df.Ministerium_Kuerzel == "IM"]                                    # by Kürzel (federführend)
-df[df.Beteiligte_Ministerien_Kuerzel.fillna("").str.contains("IM")]   # by Kürzel (auch beteiligt)
-df[df.Anfragedatum >= "2024-01-01"]                                   # by Datum
+df[df.Fraktion == "AfD"]
+df[df.Anfrager_Alle.str.contains("Wagner", na=False)]                 # FULL Anfrager-Liste
+df[df.Schlagworte.str.contains("Polizei", na=False)]
+df[df.Ministerium_Kuerzel == "IM"]                                    # federführend
+df[df.Beteiligte_Ministerien_Kuerzel.fillna("").str.contains("IM")]   # auch beteiligt
+df[df.Anfragedatum >= "2024-01-01"]
 df[df.Anzahl_Abgeordnete >= 5]                                        # Sammelanfragen
+df[df.Datenqualität == "ok"]                                          # nur saubere Zeilen
+df[df.Antworttext_Status == "pdf_missing"]                            # Antwort-PDF auf Landtag-CDN nicht verfügbar
 ```
 
-`Anfrager` (DB-Spalte) bleibt für Rückwärtskompatibilität erhalten und enthält maximal 2 Namen + `u.a.`. **Für Auswertungen `Anfrager_Alle` nutzen** — das ist der vollständige Set inkl. aller Co-Anfrager.
+`Anfrager` (DB-Spalte) bleibt als Rohwert erhalten — max 2 Namen + `u.a.`. **Für Auswertungen `Anfrager_Alle` nutzen.**
 
 Antworttext einer Zeile:
 
@@ -169,7 +132,7 @@ md_path = df.loc[df.Drucksache_Antwort_Nr == "18/1006", "Antworttext"].iloc[0]
 print(open(md_path, encoding="utf-8").read())
 ```
 
-CSV/JSONL export:
+CSV-Export:
 
 ```sh
 python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv', index=False)"
@@ -177,24 +140,18 @@ python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv
 
 ## Don't
 
+- `data/db_index.xlsx` von Hand editieren oder mit anderen Verben überschreiben — immutable Snapshot, ausschließlich Domain von `crawl`.
+- Spalten `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` von Hand editieren — `fetch-text`-Domain.
+- Spalten `Anfrager_Alle`, `Anzahl_Abgeordnete`, `Beteiligte_Ministerien_Kuerzel` von Hand editieren — werden bei Re-Run überschrieben. Manuelle Korrekturen mit `anfrager_manual` (in `Extract_Flags`) markieren, dann werden sie geschützt.
 - Zwei Verben **gleichzeitig** auf dieselbe XLSX. File-Lock blockt zwar, ist aber unsauber.
-- `data/db_index.xlsx` von Hand editieren oder mit anderen Verben überschreiben — das ist der immutable DB-Snapshot, ausschließlich Domain von `crawl`.
-- Spalten `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` von Hand editieren — `fetch-text` Domain.
-- Spalten `Anfrager_Alle`, `Anzahl_Abgeordnete`, `Beteiligte_Ministerien_Kuerzel` von Hand editieren — `extract-all-anfrager` / `extract-multi-ministerium` Domain. Beide sind idempotent und werden bei Re-Run überschrieben.
-- Aus `Anfrager` (DB-Spalte) auf die tatsächliche Anzahl Mit-Anfragender schließen — die ist auf 2 gekappt + `u.a.`. Immer `Anzahl_Abgeordnete` / `Anfrager_Alle` nutzen.
-- Werte aus `data/vocab_novelty.log` automatisch korrigieren. Eine ungewohnte Fraktion/Ministerium kann ein echter neuer Eintrag sein. Erst prüfen, dann ggf. `Index/ministerium_aliases.xlsx` ergänzen oder `Index/ministerien.xlsx` anpassen.
-- `--rps` über 4 ohne Grund. Polite-Default für ein kleines public-sector site.
-- Bei `crawl`-0-Hits blind retryen — vermutlich `bootstrap_search` / Pagination-Parser-Anker hat sich verschoben (HTML-Struktur des Landtags geändert).
-
-## Common failures
-
-- **`pdftotext: not found`** → `brew install poppler` (macOS).
-- **`pdftotext` schluckt das D in „AfD"** → Spelling landet als "Af" in `vocab_novelty.log`. Bekannter pdftotext-Quirk auf manchen PDFs.
-- **`Vormerkung` vs `Vorbemerkung`** → frühe WP18-Antworten nutzen alte Schreibweise; Title-Regex akzeptiert beide.
-- **`fetch-text` reportet 404** → Drucksache existiert online nicht (zurückgezogen oder noch unveröffentlicht). Status `no_answer_yet` ist erwartet.
-- **`Extract_Flags` enthält `missing_ministerium`** auf einer Zeile mit gefülltem Kürzel → Bug-Indikator. `compute_extract_flags` checkt seit Fix `ministerium OR ministerium_canonical OR ministerium_kuerzel`. Wenn Lücke trotzdem markiert: nochmal `normalize` laufen lassen, dann manueller Re-Compute der Flags.
+- Aus `Anfrager` (DB-Spalte) auf die echte Anzahl Mit-Anfragender schließen.
+- Werte aus `data/vocab_novelty.log` automatisch absorbieren — siehe `vocabulary.md`.
+- `--rps` über 4 ohne Grund.
+- `Antworttext_Status=pdf_missing` rückgängig machen, ohne den Landtag-CDN-Bug zu verifizieren — `fetch-text` würde wieder denselben falschen PDF-Inhalt einlesen. Re-Try nur mit `fetch-text --force`, nachdem manuell geprüft wurde, dass der Landtag jetzt den richtigen PDF ausliefert.
 
 ## Reference
 
-Vollständige Spezifikation: `docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`.
-Operator-Beobachtungen: `auswertung_fehlende_daten.md`.
+- `edge-cases.md` — Anfrager-Quirks, PDF-Tippfehler, Status-Edge-Cases, Crawl-Quirks.
+- `vocabulary.md` — Stammdaten, Namens-/Format-Konventionen, Fraktion- und Min-Aliase.
+- `docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md` — vollständige Architektur-Spec.
+- `auswertung_fehlende_daten.md` — Operator-Beobachtungen.

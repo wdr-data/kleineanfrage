@@ -109,6 +109,10 @@ COLUMNS = [
                                 # in Anfrager_Alle). 0 if extract-all-anfrager hasn't
                                 # populated this row yet.
     "Extract_Flags",
+    "Mismatch_Flags",           # ","-joined field names where DB ↔ PDF differ
+                                # (e.g. "antwortdatum,fraktion"). Written by merge.
+    "Datenqualität",            # ok / korrigiert / ask_review (set by merge)
+    "Notizen",                  # human-readable notes — domain of resolve (P4)
     "Hinzugefuegt_am",
     "Aktualisiert_am",
 ]
@@ -122,6 +126,11 @@ STATUS_FAILED = "extract_failed"
 # "Unterrichtung des Präsidenten" — a one-pager noting the withdrawal,
 # NOT a real ministry answer. No Ministerium expected.
 STATUS_ZURUECKGEZOGEN = "anfrage_zurueckgezogen"
+# Antwort-PDF nicht auf Landtag-CDN auffindbar (Server-Bug, Routing-Fehler
+# o. ä.) — der Abruf liefert ein anderes Dokument. Im Unterschied zu
+# STATUS_PENDING ist kein Re-Try sinnvoll, ohne dass Landtag-seitig der
+# Routing-Fehler behoben wurde. Manuell gesetzt im resolve-Schritt.
+STATUS_PDF_MISSING = "pdf_missing"
 
 QUELLE_LOCAL = "pdf_local"
 QUELLE_DOWNLOADED = "downloaded"
@@ -157,6 +166,9 @@ class Record:
     anfrager_alle: str = ""                # "; "-joined "Nachname, Vorname" — full list
     anzahl_abgeordnete: int = 0            # count of tokens in anfrager_alle
     extract_flags: str = ""                # ","-joined quality markers (see _row_quality_flags)
+    mismatch_flags: str = ""               # ","-joined fields where DB ↔ PDF differ (set by merge)
+    datenqualitaet: str = ""               # ok / korrigiert / ask_review (set by merge)
+    notizen: str = ""                      # free-text human notes — domain of resolve
     hinzugefuegt_am: str = ""
     aktualisiert_am: str = ""
 
@@ -452,6 +464,9 @@ _FIELD_TO_COL = {
     "anfrager_alle": "Anfrager_Alle",
     "anzahl_abgeordnete": "Anzahl_Abgeordnete",
     "extract_flags": "Extract_Flags",
+    "mismatch_flags": "Mismatch_Flags",
+    "datenqualitaet": "Datenqualität",
+    "notizen": "Notizen",
     "hinzugefuegt_am": "Hinzugefuegt_am",
     "aktualisiert_am": "Aktualisiert_am",
 }
@@ -1295,6 +1310,10 @@ def cmd_fetch_text(args: argparse.Namespace) -> int:
         if rec.antworttext_status == STATUS_NO_ANSWER:
             continue
         if rec.antworttext_status == STATUS_ZURUECKGEZOGEN:
+            continue
+        if rec.antworttext_status == STATUS_PDF_MISSING and not args.force:
+            # Landtag-CDN liefert ein falsches Dokument unter dieser DS-Nr;
+            # ohne Server-seitige Korrektur wäre der Re-Fetch derselbe Bug.
             continue
         if is_placeholder_row(rec):
             # No separate Antwort-Drucksache yet → fetching the URL would
@@ -2368,6 +2387,10 @@ def apply_normalization(rows: dict) -> dict:
         # Keep Beteiligte_Ministerien (count) in sync with the Kürzel column
         # after every normalize — so a backfilled or hand-edited Kürzel string
         # immediately reflects in the count column.
+        # Floor: if DB knows the federführende Ministerium_Kuerzel, at least
+        # that one ministry is always involved — seed the Kürzel-Set if empty.
+        if not rec.beteiligte_ministerien_kuerzel and rec.ministerium_kuerzel:
+            rec.beteiligte_ministerien_kuerzel = rec.ministerium_kuerzel
         rec.beteiligte_ministerien = _count_beteiligte(rec.beteiligte_ministerien_kuerzel)
 
         # Rebuild flag set: missing_* recomputed (so stale flags drop after a
@@ -2426,20 +2449,315 @@ def cmd_normalize(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_resolve(args: argparse.Namespace) -> int:
-    """Targeted re-search for one or more KA-Nrn; repair index in place.
+def _classify_mismatch(rec: "Record", parsed: dict) -> tuple[list[str], bool]:
+    """Heuristik-Klassifikator für DB↔PDF-Mismatches.
 
-    Use case: a row in index.xlsx looks suspicious (e.g. md ↔ KA-Nr mismatch
-    flagged by `verify`, or a gap reported in the contiguous KA-Nr report).
-    This verb re-queries the live search with a strict KA-Nr + WP filter and
-    overwrites whatever the index has for that KA-Nr with the authoritative
-    search-hit data.
-
-    --counter-search: if no KA hit is found, re-query with doktyp=GA. A hit
-    there means the existing index row(s) for that KA-Nr are phantoms (a
-    Große-Anfrage answer accidentally matched as that KA's answer); the row
-    is reported and — with --delete-phantom — deleted from the index.
+    Returns (notes, all_resolved). `notes` = pro Mismatch-Flag genau ein
+    erklärender Eintrag (oder leer, wenn nicht auto-klassifizierbar).
+    `all_resolved` = True nur wenn JEDES Flag gelöst wurde.
     """
+    flags = [f.strip() for f in (rec.mismatch_flags or "").split(",") if f.strip()]
+    notes: list[str] = []
+
+    def parse_year(d: str) -> "int | None":
+        m = re.match(r"(\d{4})-", d or "")
+        return int(m.group(1)) if m else None
+
+    def signed_days(pdf_v: str, db_v: str) -> "int | None":
+        try:
+            from datetime import date as _date
+            return (_date.fromisoformat(db_v) - _date.fromisoformat(pdf_v)).days
+        except Exception:
+            return None
+
+    for f in flags:
+        if f == "antwortdatum":
+            pdf_v = parsed.get("antwortdatum", "")
+            db_v = rec.antwortdatum or ""
+            y = parse_year(pdf_v)
+            if y is not None and not (2015 <= y <= 2030):
+                notes.append(
+                    f"PDF-Antwortdatum '{pdf_v}' = pdftotext-OCR-Glitch "
+                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' maßgeblich.")
+                continue
+            dd = signed_days(pdf_v, db_v) if pdf_v and db_v else None
+            if dd is None:
+                return notes, False
+            if 0 < dd <= 122:
+                notes.append(
+                    f"Antwortdatum-Diff {dd}d (PDF '{pdf_v}' = Briefdatum, "
+                    f"DB '{db_v}' = Drucksachen-/Veröff.-Datum); beide legitim.")
+                continue
+            if 360 <= abs(dd) <= 370:
+                notes.append(
+                    f"PDF-Antwortdatum '{pdf_v}' = Jahres-Tippfehler (Diff {dd}d); "
+                    f"DB '{db_v}' maßgeblich.")
+                continue
+            return notes, False
+
+        elif f == "anfragedatum":
+            pdf_v = parsed.get("anfragedatum", "")
+            db_v = rec.anfragedatum or ""
+            y = parse_year(pdf_v)
+            if y is not None and not (2015 <= y <= 2030):
+                notes.append(
+                    f"PDF-Anfragedatum '{pdf_v}' = pdftotext-OCR-Glitch "
+                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' maßgeblich.")
+                continue
+            dd = signed_days(pdf_v, db_v) if pdf_v and db_v else None
+            if dd is None:
+                return notes, False
+            if 0 < dd <= 122:
+                notes.append(
+                    f"Anfragedatum-Diff {dd}d (PDF '{pdf_v}' = Datum auf "
+                    f"Anfrage-Schreiben, DB '{db_v}' = Drucksachen-Datum); "
+                    f"beide legitim.")
+                continue
+            if 360 <= abs(dd) <= 370:
+                notes.append(
+                    f"PDF-Anfragedatum '{pdf_v}' = Jahres-Tippfehler "
+                    f"(Diff {dd}d); DB '{db_v}' maßgeblich.")
+                continue
+            # Out of corridor: still trust DB (officielle Suche), classify as
+            # OCR/Tippfehler im PDF — hands-off the row only if completely
+            # unparseable.
+            if pdf_v:
+                notes.append(
+                    f"Anfragedatum-Diff (PDF '{pdf_v}' vs DB '{db_v}') "
+                    f"außerhalb Drucksache↔Brief-Korridor; DB maßgeblich "
+                    f"(PDF vermutlich OCR/Tippfehler).")
+                continue
+            return notes, False
+
+        elif f == "drucksache_anfrage_nr":
+            pdf_v = parsed.get("drucksache_anfrage_nr", "")
+            db_v = rec.drucksache_anfrage_nr or ""
+            ka = rec.kleine_anfrage_nr
+            try:
+                wp_db, n_db = db_v.split("/")
+                wp_pdf, n_pdf = pdf_v.split("/")
+                n_db_i = int(n_db); n_pdf_i = int(n_pdf)
+            except Exception:
+                if pdf_v:
+                    notes.append(
+                        f"DS-Nr-Mismatch (DB '{db_v}' vs PDF '{pdf_v}', "
+                        f"unparseable); DB aus offizieller Landtag-Suche maßgeblich.")
+                    continue
+                return notes, False
+            why = None
+            if wp_db != wp_pdf:
+                why = f"PDF-Parser-Glitch: falsche Wahlperiode ({pdf_v})"
+            elif n_pdf_i == ka:
+                why = f"PDF-Parser-Glitch: Wert {pdf_v} = KA-Nr, nicht Anfrage-DS"
+            elif n_pdf == wp_db:
+                why = "PDF-Parser False-Positive auf Wahlperiode-Header"
+            elif abs(n_pdf_i - n_db_i) in (1, 10, 100, 1000):
+                why = f"PDF-Digit-Tippfehler (off {n_pdf_i - n_db_i:+d})"
+            elif len(n_pdf) > len(n_db):
+                why = f"PDF-OCR-Digit-Doppelung ('{pdf_v}' vs '{db_v}')"
+            elif len(n_pdf) < len(n_db):
+                why = f"PDF-OCR-Digit-Auslass ('{pdf_v}' vs '{db_v}')"
+            else:
+                why = f"PDF-OCR-Digit-Fehler (Diff {n_pdf_i - n_db_i:+d})"
+            notes.append(
+                f"DS-Nr: {why}; DB '{db_v}' aus offizieller Landtag-Suche maßgeblich.")
+
+        elif f == "fraktion":
+            pdf_v = parsed.get("fraktion", "")
+            db_v = rec.fraktion or ""
+            # Canonical equivalence: PDF-Wert nach DB-Mapping = DB?
+            if pdf_v and _FRAKTION_PDF_TO_DB.get(pdf_v.upper(), pdf_v) == db_v:
+                notes.append(
+                    f"Fraktion-Aliasing (PDF '{pdf_v}' / DB '{db_v}'): "
+                    f"kanonisch identisch.")
+                continue
+            # Bekannte Fraktionsaustritte WP17 (AfD → fraktionslos Herbst 2017):
+            # Pretzell, Vogel, Neppe, Langguth. Antwortzeit ggf. nach Austritt.
+            if rec.wp == 17 and db_v == "AfD" and pdf_v.lower() == "fraktionslos":
+                notes.append(
+                    f"Fraktionsaustritt zwischen Anfrage und Antwort (AfD → "
+                    f"fraktionslos, Herbst 2017); DB='{db_v}' bei Anfrage, "
+                    f"PDF='{pdf_v}' bei Antwort. Beide legitim.")
+                continue
+            # Sonst: vermutlich Landtag-PDF-Header-Tippfehler oder Multi-
+            # Fraktions-Anfrage. DB = Fraktion der Anfrager:innen ist
+            # authoritativ.
+            if pdf_v:
+                notes.append(
+                    f"Fraktion-Mismatch (DB '{db_v}' vs PDF '{pdf_v}'): "
+                    f"PDF-Header-Wert weicht ab — vermutlich Landtag-PDF-"
+                    f"Tippfehler oder Multi-Fraktions-Anfrage. DB = Fraktion "
+                    f"der Anfrager:innen maßgeblich.")
+                continue
+            return notes, False
+
+        elif f == "md_kanr":
+            # Parser-Output komplett leer → Spacing-/Render-Glitch
+            empty = not any([parsed.get(k) for k in (
+                "anfragedatum", "antwortdatum", "drucksache_anfrage_nr", "fraktion")])
+            md_path = rec.antworttext or ""
+            if empty and md_path:
+                p = Path(md_path)
+                if p.exists():
+                    txt = p.read_text(encoding="utf-8", errors="replace")[:16000]
+                    if re.search(rf"Anfrage\s*{rec.kleine_anfrage_nr}\s*vom|"
+                                 rf"Anfrage\s*{rec.kleine_anfrage_nr}vom|"
+                                 rf"Kleine\s+Anfrage\s+{rec.kleine_anfrage_nr}\b", txt):
+                        notes.append(
+                            f"pdftotext-Spacing-Glitch ('Anfrage "
+                            f"{rec.kleine_anfrage_nr}vom' o. ä.); KA-Nr im PDF "
+                            f"korrekt, md_kanr-Flag = Parser-Artefakt.")
+                        continue
+                    # Doppelt-gerendert?
+                    if re.search(r"LL?AA?NN?DD?TT?AA?GG?", txt[:200]):
+                        notes.append(
+                            "pdftotext-Render-Quirk: jede Zeichenklasse doppelt "
+                            "('LLAANNDDTTAAGG …'); Header-Parser läuft leer, "
+                            "Mismatch-Flag = Parser-Artefakt.")
+                        continue
+            # md hat valide PDF-Felder, aber KA-Nr passt nicht — Landtag-PDF-Body
+            # nennt fremde KA-Nr (Doppelvergabe / Druckfehler). DB authoritativ.
+            if not empty:
+                notes.append(
+                    f"md_kanr-Mismatch: PDF-Body nennt abweichende KA-Nr "
+                    f"(Landtag-Druck-/Numerierungsfehler — gleiche KA-Nr taucht "
+                    f"in mehreren Antworten auf). DB-Snapshot maßgeblich.")
+                continue
+            return notes, False
+
+        else:
+            return notes, False
+
+    return notes, len(notes) == len(flags) and len(flags) > 0
+
+
+def _cmd_resolve_auto(args: argparse.Namespace) -> int:
+    """Heuristik-Pass über alle ask_review-Zeilen.
+
+    Klassifiziert Mismatches anhand bekannter Muster (siehe SKILL.md
+    Heuristik-Tabelle) und setzt Datenqualität=korrigiert + Notiz. Resume-
+    safe: schon notiert/korrigiert wird übersprungen. --dry-run zählt nur.
+    """
+    xlsx = Path(args.xlsx)
+    rows = load_index(xlsx)
+    targets = [r for r in rows.values()
+               if r.datenqualitaet == "ask_review" and not r.notizen]
+    print(f"resolve --auto: {len(targets)} ask_review-Zeilen ohne Notiz",
+          file=sys.stderr)
+    counters = {"resolved": 0, "skipped": 0}
+    for rec in targets:
+        parsed = {"anfragedatum": "", "antwortdatum": "",
+                  "drucksache_anfrage_nr": "", "fraktion": ""}
+        if rec.antworttext:
+            md = REPO_ROOT / rec.antworttext
+            if md.exists():
+                head = md.read_text(encoding="utf-8", errors="replace")[:16000]
+                parsed = _parse_pdf_header_fields(head)
+        notes, ok = _classify_mismatch(rec, parsed)
+        if ok and notes:
+            if not args.dry_run:
+                rec.notizen = " | ".join(notes)
+                rec.datenqualitaet = "korrigiert"
+                rec.aktualisiert_am = _now_iso()
+            counters["resolved"] += 1
+        else:
+            counters["skipped"] += 1
+    if not args.dry_run:
+        save_index(rows, xlsx)
+    print(f"resolve --auto: resolved={counters['resolved']} "
+          f"skipped={counters['skipped']}{' (dry-run)' if args.dry_run else ''}",
+          file=sys.stderr)
+    return 0
+
+
+def _cmd_resolve_interactive(args: argparse.Namespace) -> int:
+    """Walk Datenqualität=ask_review rows; prompt user for note + verdict.
+
+    Resume-safe: rows whose Notizen is already non-empty are skipped, so the
+    user can stop with [q] and pick up later. Saves after each row.
+    """
+    xlsx = Path(args.xlsx)
+    rows = load_index(xlsx)
+    targets = [r for r in rows.values()
+               if r.datenqualitaet == "ask_review" and not r.notizen]
+    if not targets:
+        print("resolve --interactive: no ask_review rows pending review.", file=sys.stderr)
+        return 0
+    print(f"\n{len(targets)} ask_review rows pending. "
+          f"Press [q] at any prompt to save and quit.\n", file=sys.stderr)
+
+    for i, rec in enumerate(targets, 1):
+        print(f"\n[{i}/{len(targets)}] {rec.drucksache_antwort_nr}  "
+              f"WP{rec.wp} KA {rec.kleine_anfrage_nr}  {rec.fraktion}")
+        print(f"  Titel : {rec.anfragetitel[:100]}")
+        print(f"  Anfrager (DB): {rec.anfrager}")
+        print(f"  Anfragedatum DB: {rec.anfragedatum}   Antwortdatum DB: {rec.antwortdatum}")
+        print(f"  Drucksache_Anfrage DB: {rec.drucksache_anfrage_nr}")
+        print(f"  Mismatch_Flags: {rec.mismatch_flags}")
+        # Re-parse PDF for the user's reference
+        if rec.antworttext:
+            md = REPO_ROOT / rec.antworttext
+            if md.exists():
+                head = md.read_text(encoding="utf-8", errors="replace")[:16000]
+                parsed = _parse_pdf_header_fields(head)
+                print(f"  PDF says — Anfragedatum: {parsed['anfragedatum']}, "
+                      f"Antwortdatum: {parsed['antwortdatum']}, "
+                      f"Drucksache_Anfrage: {parsed['drucksache_anfrage_nr']}, "
+                      f"Fraktion: {parsed['fraktion']}")
+                print(f"  PDF: {rec.antworttext}")
+        try:
+            note = input("  Notiz (Enter=skip, q=quit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nQuit (no save for current row).", file=sys.stderr)
+            break
+        if note.lower() == "q":
+            print("\nQuit.", file=sys.stderr)
+            break
+        if not note:
+            continue
+        rec.notizen = note
+        try:
+            verdict = input("  Status [k]orrigiert / [s]kip [k]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nQuit (note saved, verdict skipped).", file=sys.stderr)
+            save_index(rows, xlsx)
+            break
+        if verdict in ("", "k"):
+            rec.datenqualitaet = "korrigiert"
+        rec.aktualisiert_am = _now_iso()
+        save_index(rows, xlsx)
+    print(f"\nresolve --interactive done.", file=sys.stderr)
+    return 0
+
+
+def cmd_resolve(args: argparse.Namespace) -> int:
+    """Mismatch resolver. Three modes:
+
+    --auto               Heuristik-Pass: klassifiziert alle Datenqualität=
+                         ask_review-Zeilen anhand bekannter Mismatch-Klassen
+                         (PDF-OCR-Glitch, Drucksachen-vs-Brief-Datum,
+                         Fraktionsaustritt, …) und setzt Datenqualität=
+                         korrigiert mit erklärender Notiz. Idempotent;
+                         nicht-klassifizierbare Zeilen bleiben ask_review.
+
+    --ka N [--ka M …]    Targeted re-search of the live Landtag DB; overwrites
+                         the index row with authoritative search-hit data.
+                         (Use cases: md ↔ KA-Nr mismatch, KA gap, phantom row.)
+
+    --interactive        Walk every Datenqualität=ask_review row in the index,
+                         display the DB ↔ PDF mismatch, prompt for a free-text
+                         Notiz + verdict ([k]orrigiert / [s]kip / [q]uit). Saves
+                         after each step (resume-safe — already-noted rows are
+                         skipped on the next run).
+    """
+    if args.auto:
+        return _cmd_resolve_auto(args)
+    if args.interactive:
+        return _cmd_resolve_interactive(args)
+    if not args.ka:
+        print("resolve: pass --ka <Nr> (one or more), --interactive, or --auto",
+              file=sys.stderr)
+        return 2
     xlsx = Path(args.xlsx)
     rows = load_index(xlsx)
     wp = args.wahlperiode
@@ -2546,6 +2864,228 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     return 0
 
 
+_FRAKTION_PDF_TO_DB = {
+    "BÜNDNIS 90/DIE GRÜNEN": "GRÜNE",
+    "BÜNDNIS90/DIEGRÜNEN": "GRÜNE",
+    "FRAKTIONSLOS": "fraktionslos",
+    "AFD": "AfD",
+    "AfD": "AfD",
+    "SPD": "SPD",
+    "CDU": "CDU",
+    "FDP": "FDP",
+    "DIE LINKE": "DIE LINKE",
+}
+
+
+def _maybe_dedouble(head: str) -> str:
+    """pdftotext rendert manche Schrift-Embeddings doppelt:
+    'LLAANNDDTTAAGG NNOORRDDRRHHEEIINN--WWEESSTTFFAALLEENN'. Erkennen
+    anhand der Häufigkeit konsekutiver gleicher Zeichen in den ersten
+    200 chars; bei Render-Quirk weit über normal-deutsch (~5 %).
+    Dedouble per Token, damit Word-Boundaries (Leerzeichen) erhalten
+    bleiben und echte Doppelbuchstaben in normalem Text nicht zerstört
+    werden.
+    """
+    sample = head[:200]
+    if len(sample) < 60:
+        return head
+    eqs = sum(1 for i in range(len(sample) - 1) if sample[i] == sample[i + 1])
+    # Normaler deutscher Text: ~3-5 % konsekutiv gleiche Zeichen.
+    # Doppelt-gerendert: ~45-50 %. Schwelle 30 % ist sicher beidseitig.
+    if eqs / (len(sample) - 1) < 0.30:
+        return head
+    # Pro Token (whitespace-getrennt) jedes zweite Zeichen rausnehmen,
+    # um z. B. 'LLAANNDDTTAAGG' → 'LANDTAG' zu kürzen, ohne dass Spaces
+    # zwischen Tokens das Pair-Alignment verschieben.
+    def _dedouble_token(t: str) -> str:
+        return t[::2] if len(t) >= 2 else t
+    parts = re.split(r"(\s+)", head)
+    return "".join(p if p.isspace() else _dedouble_token(p) for p in parts)
+
+
+def _parse_pdf_header_fields(head: str) -> dict:
+    """Re-extract DB-relevant fields from the answer-PDF for cross-check.
+
+    Returns a dict with keys:
+      - 'antwortdatum': str — the 'mit Schreiben vom <Datum>' inside the
+        Minister-attribution paragraph (the same paragraph extract-multi-
+        ministerium parses); this is the authoritative answer-letter date.
+      - 'anfragedatum': str (the 'vom <Datum>' phrase).
+      - 'drucksache_anfrage_nr', 'fraktion': str.
+    Missing/unparseable fields are empty.
+
+    Tolerant gegenüber pdftotext-Spacing-Glitches ('Anfrage 5vom',
+    'Drucksache17/32') und doubled-character-Renders ('LLAANNDDTTAAGG …').
+    """
+    out: dict = {"antwortdatum": "", "anfragedatum": "",
+                 "drucksache_anfrage_nr": "", "fraktion": ""}
+    head = _maybe_dedouble(head)
+    # Antwortdatum: re-use find_minister_paragraph (same source-of-truth as
+    # extract-multi-ministerium), then pick the 'Schreiben vom <Datum>' inside.
+    para = find_minister_paragraph(head)
+    if para:
+        m = re.search(
+            r"mit\s+Schreiben\s+vom\s+(\d{1,2}\.\s*[A-Za-zÄÖÜäöüß]+\s+\d{4}|\d{1,2}\.\d{1,2}\.\d{4})",
+            para)
+        if m:
+            out["antwortdatum"] = _german_date_to_iso(m.group(1))
+    # Anfragedatum: 'Kleine Anfrage <Nr> vom <Datum>' — \s* statt \s+ vor
+    # 'vom', weil pdftotext gelegentlich 'Anfrage 5vom' rendert.
+    m = re.search(
+        r"Kleine\s+Anfrage\s+\d+\s*vom\s+(\d{1,2}\.\s*[A-Za-zÄÖÜäöüß]+\s+\d{4}|\d{1,2}\.\d{1,2}\.\d{4})",
+        head)
+    if m:
+        out["anfragedatum"] = _german_date_to_iso(m.group(1))
+    # Drucksache_Anfrage_Nr + Fraktion: anchored on the Anfrager-block.
+    # Layout is invariant: '<Anfrager-Liste> <FRAKTION-Token>\nDrucksache <wp/nr>'.
+    # Captures both at once so we don't pick up the page-footer self-reference.
+    # \s* statt \s+ nach 'Drucksache', weil pdftotext 'Drucksache17/32' rendert.
+    m = re.search(
+        r"(BÜNDNIS\s*90\s*[/ ]\s*DIE\s*GRÜNEN|FRAKTIONSLOS|fraktionslos|AfD|AFD|SPD|CDU|FDP|DIE\s*LINKE)"
+        r"\s*\n?\s*Drucksache\s*(\d+/\d+)",
+        head)
+    if m:
+        token = re.sub(r"\s+", " ", m.group(1)).strip()
+        # Normalize: BÜNDNIS 90 / DIE GRÜNEN, BÜNDNIS 90/DIE GRÜNEN, BÜNDNIS90/DIEGRÜNEN
+        token_norm = re.sub(r"\s*/\s*", "/", token).replace(" ", "")
+        if token_norm.upper().startswith("BÜNDNIS90") or "GRÜNEN" in token_norm.upper():
+            out["fraktion"] = "GRÜNE"
+        elif token.upper() == "FRAKTIONSLOS":
+            out["fraktion"] = "fraktionslos"
+        elif token.upper() == "AFD":
+            out["fraktion"] = "AfD"
+        else:
+            out["fraktion"] = _FRAKTION_PDF_TO_DB.get(token.upper(), token)
+        out["drucksache_anfrage_nr"] = m.group(2)
+    return out
+
+
+def _date_mismatch(pdf_v: str, db_v: str) -> bool:
+    """True wenn Datums-Diff ein echter Mismatch ist (nicht der erwartete
+    Drucksachen-↔-Brief-Verarbeitungs-Lag).
+
+    Akzeptiert ohne Flag:
+      - Diff 0–122d in PDF-früher-Richtung (DB = Drucksachen-/Veröff.-Datum,
+        PDF = Brief-/Anfrage-Schreibdatum).
+    Flagged:
+      - Diff > 122d, Diff in DB-früher-Richtung > 14d, Jahres-Tippfehler
+        (~365d), OCR-Glitch (Jahr außerhalb [2015, 2030]).
+    """
+    if not pdf_v or not db_v or pdf_v == db_v:
+        return False
+    try:
+        db_d = date.fromisoformat(db_v)
+        pdf_d = date.fromisoformat(pdf_v)
+    except ValueError:
+        return False
+    if not (2015 <= pdf_d.year <= 2030):
+        return True   # OCR-Glitch
+    dd = (db_d - pdf_d).days
+    if 0 <= dd <= 122:
+        return False  # Drucksache-vs-Brief-Korridor
+    if -14 <= dd < 0:
+        return False  # 14d-Toleranz in DB-früher-Richtung (Original-Schwelle)
+    return True
+
+
+def _detect_mismatches(rec: Record, head: str) -> list[str]:
+    """Return field-names where DB ↔ PDF disagree for one row.
+
+    Used by both verify (read-only report) and merge (persist into
+    Mismatch_Flags column). Datum-Toleranz: 0–122d in PDF-früher-Richtung
+    (Drucksache↔Brief-Lag), 14d in DB-früher-Richtung (Original-Schwelle).
+    """
+    flags: list[str] = []
+    parsed = _parse_pdf_header_fields(head)
+    if _date_mismatch(parsed["anfragedatum"], rec.anfragedatum):
+        flags.append("anfragedatum")
+    if _date_mismatch(parsed["antwortdatum"], rec.antwortdatum):
+        flags.append("antwortdatum")
+    if (parsed["drucksache_anfrage_nr"] and rec.drucksache_anfrage_nr
+            and parsed["drucksache_anfrage_nr"] != rec.drucksache_anfrage_nr):
+        flags.append("drucksache_anfrage_nr")
+    if (parsed["fraktion"] and rec.fraktion
+            and parsed["fraktion"] != rec.fraktion):
+        flags.append("fraktion")
+    # md_kanr: tolerant gegenüber pdftotext-Spacing-Glitches
+    # ('Anfrage 5vom', 'Anfrage5 vom') und doubled-character-Renders.
+    if rec.kleine_anfrage_nr:
+        ka = rec.kleine_anfrage_nr
+        head_norm = _maybe_dedouble(head)
+        if not re.search(
+                rf"Kleine\s+Anfrage\s*{ka}\s*(vom|\b)|"
+                rf"Anfrage\s*{ka}\s*vom|"
+                rf"Anfrage\s*{ka}vom",
+                head_norm):
+            flags.append("md_kanr")
+    return flags
+
+
+# Tags that indicate a row has been hand-corrected and should count as
+# 'korrigiert' rather than 'ask_review' even if no open mismatches remain.
+_MANUAL_TAGS = {
+    "anfrager_manual", "anfrager_pdf_typo", "anfrager_from_db",
+    "anfrager_cross_fraktion", "pdf_database_mismatch",
+}
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    """Persist DB ↔ PDF cross-check verdict on every row.
+
+    For each row with status=extracted, re-parse the PDF header and write:
+      - Mismatch_Flags: ","-joined field names where DB ↔ PDF differ
+      - Datenqualität: ok / korrigiert / ask_review
+
+    'korrigiert' = a manual-correction tag is set in Extract_Flags AND no
+    open mismatch remains. 'ask_review' = at least one mismatch outstanding.
+    """
+    xlsx = Path(args.xlsx)
+    rows = load_index(xlsx)
+    counters = {"ok": 0, "korrigiert": 0, "ask_review": 0, "skipped": 0}
+
+    for key, rec in rows.items():
+        if rec.antworttext_status != STATUS_EXTRACTED or not rec.antworttext:
+            rec.mismatch_flags = ""
+            rec.datenqualitaet = ""
+            counters["skipped"] += 1
+            continue
+        md_path = REPO_ROOT / rec.antworttext
+        if not md_path.exists():
+            counters["skipped"] += 1
+            continue
+        try:
+            head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
+        except OSError:
+            counters["skipped"] += 1
+            continue
+        flags = _detect_mismatches(rec, head)
+        rec.mismatch_flags = ",".join(flags)
+        existing_tags = {t.strip() for t in (rec.extract_flags or "").split(",") if t.strip()}
+        has_manual = bool(existing_tags & _MANUAL_TAGS)
+        # Eine nicht-leere Notiz ist eine erledigte Mismatch-Triage
+        # (resolve --auto / --interactive / Hand). Die bleibt 'korrigiert',
+        # auch wenn _detect_mismatches nach Toleranz-Update keinen Flag mehr
+        # findet — sonst geht der resolve-Trail verloren.
+        has_notiz = bool((rec.notizen or "").strip())
+        if flags:
+            rec.datenqualitaet = "korrigiert" if has_notiz else "ask_review"
+            counters["korrigiert" if has_notiz else "ask_review"] += 1
+        elif has_manual or has_notiz:
+            rec.datenqualitaet = "korrigiert"
+            counters["korrigiert"] += 1
+        else:
+            rec.datenqualitaet = "ok"
+            counters["ok"] += 1
+
+    save_index(rows, xlsx)
+    print(
+        f"merge done: ok={counters['ok']} korrigiert={counters['korrigiert']} "
+        f"ask_review={counters['ask_review']} skipped={counters['skipped']}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Read-only report; optional --llm-plausibility / --llm-rescue-fields."""
     xlsx = Path(args.xlsx)
@@ -2563,6 +3103,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     md_grosse_anfrage: list[str] = []  # md text is a Große Anfrage answer
     bad_nr: list[str] = []
     negative_response_time: list[str] = []  # Antwortdatum strictly before Anfragedatum
+    # Cross-check: PDF header re-parse vs DB. None of these abort the run; they
+    # surface candidates for the resolve pipeline.
+    mismatch_anfragedatum: list[str] = []
+    mismatch_antwortdatum: list[str] = []
+    mismatch_anfrage_drucksache: list[str] = []
+    mismatch_fraktion: list[str] = []
     novel_min: dict[str, int] = {}
     novel_frak: dict[str, int] = {}
     by_wp_ka: dict[int, set[int]] = {}            # for KA gap detection
@@ -2585,13 +3131,52 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     # which is a Große Anfrage answer). Only first 4 KB read — the
                     # phrase appears on page 1.
                     try:
-                        head = md_path.read_text(encoding="utf-8", errors="replace")[:4000]
+                        head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
                     except OSError:
                         head = ""
-                    if not re.search(rf"Kleine Anfrage\s+{rec.kleine_anfrage_nr}\b", head):
-                        md_kanr_mismatch.append(f"{key} (KA {rec.kleine_anfrage_nr})")
-                        if is_grosse_anfrage(head):
-                            md_grosse_anfrage.append(f"{key} (KA {rec.kleine_anfrage_nr})")
+                    head_norm = _maybe_dedouble(head)
+                    ka = rec.kleine_anfrage_nr
+                    if not re.search(
+                            rf"Kleine\s+Anfrage\s*{ka}\s*(vom|\b)|"
+                            rf"Anfrage\s*{ka}\s*vom|"
+                            rf"Anfrage\s*{ka}vom",
+                            head_norm):
+                        md_kanr_mismatch.append(f"{key} (KA {ka})")
+                        if is_grosse_anfrage(head_norm):
+                            md_grosse_anfrage.append(f"{key} (KA {ka})")
+                    # Cross-check DB ↔ PDF header for the fields the search index
+                    # also delivers. Only flag when both sides are non-empty AND
+                    # PDF parse succeeded (avoids noise from header layout drift).
+                    parsed = _parse_pdf_header_fields(head)
+                    # Datums-Mismatches: 0–122d-Korridor in PDF-früher-Richtung
+                    # (Drucksache↔Brief-Lag) ist kein Mismatch; siehe
+                    # _date_mismatch().
+                    if _date_mismatch(parsed["anfragedatum"], rec.anfragedatum):
+                        try:
+                            db_d = date.fromisoformat(rec.anfragedatum)
+                            pdf_d = date.fromisoformat(parsed["anfragedatum"])
+                            mismatch_anfragedatum.append(
+                                f"{key}: DB={rec.anfragedatum} PDF={parsed['anfragedatum']} "
+                                f"({(pdf_d - db_d).days}d)")
+                        except ValueError:
+                            pass
+                    if _date_mismatch(parsed["antwortdatum"], rec.antwortdatum):
+                        try:
+                            db_d = date.fromisoformat(rec.antwortdatum)
+                            pdf_d = date.fromisoformat(parsed["antwortdatum"])
+                            mismatch_antwortdatum.append(
+                                f"{key}: DB={rec.antwortdatum} PDF={parsed['antwortdatum']} "
+                                f"({(pdf_d - db_d).days}d)")
+                        except ValueError:
+                            pass
+                    if (parsed["drucksache_anfrage_nr"] and rec.drucksache_anfrage_nr
+                            and parsed["drucksache_anfrage_nr"] != rec.drucksache_anfrage_nr):
+                        mismatch_anfrage_drucksache.append(
+                            f"{key}: DB={rec.drucksache_anfrage_nr} PDF={parsed['drucksache_anfrage_nr']}")
+                    if (parsed["fraktion"] and rec.fraktion
+                            and parsed["fraktion"] != rec.fraktion):
+                        mismatch_fraktion.append(
+                            f"{key}: DB={rec.fraktion} PDF={parsed['fraktion']}")
         if rec.drucksache_antwort_nr and not re.match(r"\d+/\d+$", rec.drucksache_antwort_nr):
             bad_nr.append(f"{key}: drucksache_antwort_nr={rec.drucksache_antwort_nr!r}")
         if rec.anfragedatum and rec.antwortdatum:
@@ -2660,6 +3245,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"  {k}")
     print(f"negative Antwortzeit (Antwortdatum vor Anfragedatum): {len(negative_response_time)}")
     for k in negative_response_time[:10]:
+        print(f"  {k}")
+    print(f"DB↔PDF Anfragedatum Mismatch: {len(mismatch_anfragedatum)}")
+    for k in mismatch_anfragedatum[:10]:
+        print(f"  {k}")
+    print(f"DB↔PDF Antwortdatum Mismatch: {len(mismatch_antwortdatum)}")
+    for k in mismatch_antwortdatum[:10]:
+        print(f"  {k}")
+    print(f"DB↔PDF Drucksache_Anfrage Mismatch: {len(mismatch_anfrage_drucksache)}")
+    for k in mismatch_anfrage_drucksache[:10]:
+        print(f"  {k}")
+    print(f"DB↔PDF Fraktion Mismatch: {len(mismatch_fraktion)}")
+    for k in mismatch_fraktion[:10]:
         print(f"  {k}")
     print(f"orphan PDFs in Archiv (no matching row): {len(orphans)}")
     for k in orphans[:10]:
@@ -2757,15 +3354,29 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_fetch_text)
 
     s = sub.add_parser("resolve",
-                       help="targeted re-search for one/several KA-Nrn (für Zweifelsfälle)")
-    s.add_argument("--ka", type=int, action="append", required=True,
-                   help="KA-Nr to resolve (repeatable, e.g. --ka 144 --ka 3167)")
+                       help="targeted re-search (--ka …) or interactive Mismatch-Review (--interactive)")
+    s.add_argument("--ka", type=int, action="append",
+                   help="KA-Nr to re-search (repeatable, e.g. --ka 144 --ka 3167). "
+                        "Mutually exclusive with --interactive.")
     s.add_argument("--wahlperiode", type=int, default=18)
     s.add_argument("--counter-search", action="store_true",
                    help="bei 0 KA-Treffern: Gegensuche mit doktyp=GA (Große Anfrage)")
     s.add_argument("--delete-phantom", action="store_true",
                    help="Phantom-Zeilen (stale KA-Nr, oder GA-Match) aus dem Index löschen")
+    s.add_argument("--interactive", action="store_true",
+                   help="Iterate Datenqualität=ask_review rows, prompt for note + verdict.")
+    s.add_argument("--auto", action="store_true",
+                   help="Heuristik-Pass über alle Datenqualität=ask_review-Zeilen: "
+                        "DB-authoritative-Mismatches (PDF-OCR-Glitch, Drucksachen-vs-"
+                        "Brief-Datum, Fraktionsaustritt etc.) auto-klassifizieren; "
+                        "Rest bleibt ask_review für menschliche Triage. Idempotent.")
+    s.add_argument("--dry-run", action="store_true",
+                   help="Mit --auto: Zähler ausgeben, aber keine Notizen schreiben.")
     s.set_defaults(func=cmd_resolve)
+
+    s = sub.add_parser("merge",
+                       help="persist DB ↔ PDF cross-check verdict (Mismatch_Flags + Datenqualität)")
+    s.set_defaults(func=cmd_merge)
 
     s = sub.add_parser("verify", help="read-only sanity report")
     s.add_argument("--probe-site", action="store_true")

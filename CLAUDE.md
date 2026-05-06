@@ -4,8 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Read these first
 
-- **`README.md`** — current pipeline overview (crawl → fetch-text → scan-archive → verify), six CLI verbs, known gotchas. Start here.
-- **`skills/landtag-nrw-extraction/SKILL.md`** — agent-facing recipe with refresh loop and Nachrecherche-Strategie via `resolve`.
+- **`README.md`** — Setup, Datenqualitäts-Notizen, R-Auswertung, Pointer auf SKILL.md. Start here.
+- **`skills/landtag-nrw-extraction/SKILL.md`** — agent-facing recipe: Pipeline-Verben, Resolve-Heuristik, pandas-Read-Access, Don'ts.
+- **`skills/landtag-nrw-extraction/edge-cases.md`** — Quirks, PDF-Tippfehler, Sonderfälle (on-demand).
+- **`skills/landtag-nrw-extraction/vocabulary.md`** — Stammdaten, Format-Konventionen, Aliase (on-demand).
 - **`docs/superpowers/specs/2026-05-01-landtag-nrw-extraction-design.md`** — original design spec (architecture intent; pipeline reordering is newer).
 - **`auswertung_fehlende_daten.md`** — operator observations on data quality issues (largely addressed).
 

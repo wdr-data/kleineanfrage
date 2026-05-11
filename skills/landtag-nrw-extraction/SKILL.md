@@ -7,8 +7,9 @@ description: Use when extracting or querying Kleine Anfrage data from Landtag NR
 
 Idempotente CLI-Verben in `landtag.py` über drei Datenebenen:
 
-- `data/db_index.xlsx` — **immutable DB-Snapshot** der Landtag-Suche, geschrieben nur von `crawl`. Single Source of Truth für die DB-Sicht. Nie von Hand editieren.
-- `data/index.xlsx` — **Working-File** mit DB-Werten + PDF-Anreicherungen + Qualitäts-Spalten. Wird durch die Pipeline-Verben gepflegt.
+- `data/db_index.xlsx` — **immutable DB-Snapshot** der Landtag-Suche, geschrieben nur von `crawl`. Verifikations-Referenz für die DB-Sicht. Nie von Hand editieren.
+- `data/datum_original.xlsx` — **authoritative Datums-Quelle**: `Datum_Original` (Briefdatum, „Datum des Originals: DD.MM.YYYY") + `Datum_Ausgegeben` (Drucksachen-Veröffentlichung) pro PDF-Dokument (Anfrage & Antwort, eine Zeile je Drucksache). Geschrieben von `tools/extract_datum_original.py`. Seit 2026-05-11 maßgeblich für `Anfragedatum`/`Antwortdatum` in `index.xlsx`; DB-Datum dient nur noch der Korridor-Verifikation.
+- `data/index.xlsx` — **Working-File** mit DB-Metadaten (Anfrager, Fraktion, Systematik, …) + PDF-Anreicherungen (Datum, Ministerium, Anfrager_Alle …) + Qualitäts-Spalten. Wird durch die Pipeline-Verben gepflegt.
 - `Archiv/.../MMD<wp>-<nr>.{pdf,md}` — Original-PDFs + pdftotext-Cache.
 
 Stammdaten-Tabellen liegen in `Index/` (Fraktionen, Ministerien, Abgeordnete) — siehe `vocabulary.md`.
@@ -18,7 +19,11 @@ Stammdaten-Tabellen liegen in `Index/` (Fraktionen, Ministerien, Abgeordnete) �
 - `Datenqualität` — `ok` / `korrigiert` (manueller Tag oder nicht-leere `Notizen`) / `ask_review` (offener Mismatch ohne Notiz).
 - `Notizen` — Free-Text, Domain des `resolve`-Verbs. Sobald non-empty, bleibt die Zeile bei späteren `merge`-Läufen `korrigiert` (nicht-rückgängige Triage).
 
-**Datums-Toleranz** (in `_date_mismatch`): `anfragedatum`/`antwortdatum`-Diffs in PDF-früher-Richtung 0–122d sind kein Mismatch (DB = Drucksachen-Datum, PDF = Brief-/Schreibdatum — typischer Verarbeitungs-Lag). Geflaggt: Diff > 122d, DB-früher > 14d, Jahres-Tippfehler (~365d), OCR-Glitch (Jahr außerhalb [2015, 2030]).
+**Datums-Autorität & Korridor-Verifikation**: `Anfragedatum`/`Antwortdatum` in `index.xlsx` werden aus `datum_original.xlsx` (`Datum_Original`, also dem Briefdatum auf Seite 1 jedes PDFs) befüllt — das ist seit 2026-05-11 die Autoritäts-Quelle. Das DB-Datum aus `db_index.xlsx` wird nur noch zur Verifikation gegen das PDF-Datum gehalten. Korridor-Vergleich in `_date_mismatch`:
+
+- **Innerhalb Korridor** (PDF früher 0–122d, beide Jahre 2015–2026): erwartbarer Verarbeitungs-Lag (Briefdatum vs Drucksachen-Veröff.). PDF-Datum wird stillschweigend in `index.xlsx` übernommen, weder Flag noch Notiz.
+- **Außerhalb Korridor** (Diff > 122d, DB-früher > 14d, Jahres-Tippfehler ~365d, OCR-Glitch außerhalb [2015,2030]): `Mismatch_Flags` enthält `anfragedatum`/`antwortdatum`, `Datenqualität=ask_review`. `resolve --auto` setzt das maßgebliche Datum nach Heuristik-Tabelle (in der Regel PDF; bei klarem PDF-Parse-Artefakt ausnahmsweise DB) und schreibt das jeweils *nicht* übernommene Datum als „war: <Datum>" in `Notizen`.
+- **PDF-Datum fehlt** (`Antworttext_Status=pdf_missing`, oder `no_match` in `datum_original.xlsx`): DB-Datum bleibt als Fallback in `index.xlsx`, mit `Extract_Flags=datum_pdf_missing`.
 
 **pdftotext-Quirks** im Header-Parser (`_parse_pdf_header_fields`): Spacing-tolerant (`"Anfrage 5vom"`, `"Drucksache17/32"`) und Doubled-Character-Render (`"LLAANNDDTTAAGG …"` → automatischer Dedouble via `_maybe_dedouble`).
 
@@ -30,6 +35,7 @@ Stammdaten-Tabellen liegen in `Index/` (Fraktionen, Ministerien, Abgeordnete) �
 - Frage nach **allen Mit-Anfragenden** → Spalte `Anfrager_Alle` (DB-Spalte `Anfrager` ist auf 2 Namen + `u.a.` gekappt).
 - Frage nach **allen beteiligten Ministerien** → Spalte `Beteiligte_Ministerien_Kuerzel` (Search-Hit nennt nur das federführende Ressort).
 - Frage nach **Inhalt einer konkreten Antwort** → `Archiv/.../MMD<wp>-<nr>.md`.
+- Frage nach **PDF-Briefdatum** (Datum des Originals) oder Verifikation Anfrage-/Antwortdatum gegen DB → `data/datum_original.xlsx`.
 - **Quantitative Auswertung** → mit pandas auf der XLSX (siehe „Read access" unten).
 - Wunsch nach **frischen Daten** → Refresh-Loop unten.
 - **Zweifel an einer einzelnen Zeile** → `Datenqualität=ask_review` filtern, dann `resolve --auto` (Heuristik), gezielter `resolve --ka N`, oder im Restfall `resolve --interactive`.
@@ -45,8 +51,9 @@ python landtag.py build-abgeordnete-index                     # Index/abgeordnet
 python landtag.py extract-all-anfrager                        # Anfrager_Alle + Anzahl_Abgeordnete
 python landtag.py build-abgeordnete-index                     # 2. Pass: absorbiert 3.+ Anfrager
 python landtag.py extract-all-anfrager                        # 2. Pass: matcht erweiterten Namensindex
-python landtag.py merge                                       # Mismatch_Flags + Datenqualität
-python landtag.py resolve --auto                              # Heuristik-Auflösung der ask_review-Zeilen
+python tools/extract_datum_original.py                        # PDF-Briefdaten → data/datum_original.xlsx
+python landtag.py merge                                       # PDF↔DB-Datums-Korridor + Mismatch_Flags + Datenqualität
+python landtag.py resolve --auto                              # Heuristik-Auflösung in Richtung PDF-Datum
 python landtag.py verify                                      # sanity report
 ```
 
@@ -83,11 +90,12 @@ python landtag.py enrich-llm                                  # Stage 3 (Rest-L�
 
 | Mismatch | Heuristik | Verdict |
 |---|---|---|
-| `antwortdatum` Diff 0–122d, beide Jahre 2015–2026 | DB = Drucksachen-/Veröff.-Datum, PDF = Briefdatum „mit Schreiben vom …" | beide legitim, Notiz „Diff Nd; …" |
-| `antwortdatum` Diff ~365d, gleiches MM/DD | Jahres-Tippfehler im PDF | DB maßgeblich |
-| `antwortdatum` Jahr außerhalb [2015,2026] | pdftotext-OCR-Glitch | DB maßgeblich |
-| `anfragedatum` Diff 0–122d (DB ≥ PDF) | DB = Drucksachen-Datum, PDF = Datum auf Anfrage-Schreiben | beide legitim |
-| `anfragedatum` Diff ~365d / Jahr außerhalb Bereich | Tippfehler / OCR-Glitch | DB maßgeblich |
+| `antwortdatum` Diff 0–122d, beide Jahre 2015–2026 | DB = Drucksachen-/Veröff.-Datum, PDF = Briefdatum „mit Schreiben vom …" | **PDF maßgeblich** (Korridor) — `index.xlsx`-Antwortdatum auf PDF, stille Übernahme ohne Notiz |
+| `antwortdatum` Diff ~365d, gleiches MM/DD | Jahres-Tippfehler im PDF | **DB maßgeblich** (Ausnahme: PDF-Parse-Artefakt); Notiz „war (PDF): <PDF-Datum>" |
+| `antwortdatum` Jahr außerhalb [2015,2026] | pdftotext-OCR-Glitch | **DB maßgeblich** (Ausnahme: PDF-Parse-Artefakt); Notiz „war (PDF): <PDF-Datum>" |
+| `antwortdatum` Diff > 122d sonst | unklar, Korrigendum / Re-Datierung möglich | **PDF maßgeblich**, `ask_review` bleibt offen; Notiz „war (DB): <DB-Datum>, jetzt (PDF): <PDF-Datum>, Diff Nd" |
+| `anfragedatum` Diff 0–122d (DB ≥ PDF) | DB = Drucksachen-Datum, PDF = Datum auf Anfrage-Schreiben | **PDF maßgeblich** (Korridor) — `index.xlsx`-Anfragedatum auf PDF, stille Übernahme ohne Notiz |
+| `anfragedatum` Diff ~365d / Jahr außerhalb Bereich | Tippfehler / OCR-Glitch im PDF | **DB maßgeblich** (Ausnahme: PDF-Parse-Artefakt); Notiz „war (PDF): <PDF-Datum>" |
 | `drucksache_anfrage_nr` PDF-Wert = KA-Nr | PDF-Parser fing falsche Drucksache-Zeile | DB maßgeblich |
 | `drucksache_anfrage_nr` PDF = `<WP>/<WP>` (z. B. `17/17`) | False-Positive auf Wahlperiode-Header | DB maßgeblich |
 | `drucksache_anfrage_nr` Diff Off-by-1/10/100/1000 oder zusätzliche/fehlende Ziffer | OCR-Digit-Tippfehler im PDF | DB maßgeblich |
@@ -140,7 +148,9 @@ python -c "import pandas as pd; pd.read_excel('data/index.xlsx').to_csv('out.csv
 
 ## Don't
 
-- `data/db_index.xlsx` von Hand editieren oder mit anderen Verben überschreiben — immutable Snapshot, ausschließlich Domain von `crawl`.
+- `data/db_index.xlsx` von Hand editieren oder mit anderen Verben überschreiben — immutable Snapshot, ausschließlich Domain von `crawl`. Bleibt erhalten als Verifikations-Referenz, auch wenn die Datums-Autorität an `datum_original.xlsx` übergegangen ist.
+- `data/datum_original.xlsx` von Hand editieren — Domain von `tools/extract_datum_original.py`. Bei Fehlerverdacht (no_match / parse_failed) mit `--force` neu extrahieren; vor manueller Korrektur prüfen, ob das PDF auf Seite 1 wirklich kein „Datum des Originals:" enthält (manche PDFs mit Doubled-Character-Render-Quirk brauchen Dedouble).
+- Spalten `Anfragedatum`/`Antwortdatum` in `index.xlsx` von Hand auf DB-Wert zurücksetzen — werden bei `merge` aus `datum_original.xlsx` neu befüllt. Eingriffe gehören in `Notizen` + `Extract_Flags=datum_manual`.
 - Spalten `Antworttext`, `Antworttext_Status`, `Antworttext_Quelle` von Hand editieren — `fetch-text`-Domain.
 - Spalten `Anfrager_Alle`, `Anzahl_Abgeordnete`, `Beteiligte_Ministerien_Kuerzel` von Hand editieren — werden bei Re-Run überschrieben. Manuelle Korrekturen mit `anfrager_manual` (in `Extract_Flags`) markieren, dann werden sie geschützt.
 - Zwei Verben **gleichzeitig** auf dieselbe XLSX. File-Lock blockt zwar, ist aber unsauber.

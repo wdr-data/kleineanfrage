@@ -39,6 +39,7 @@ DATA_DIR = REPO_ROOT / "data"
 ARCHIV_DIR = REPO_ROOT / "Archiv"
 INDEX_XLSX = DATA_DIR / "index.xlsx"
 DB_INDEX_XLSX = DATA_DIR / "db_index.xlsx"  # immutable DB snapshot, written only by crawl
+DATUM_ORIGINAL_XLSX = DATA_DIR / "datum_original.xlsx"  # PDF-Briefdaten, Domain: tools/extract_datum_original.py
 SHEET_NAME = "kleine_anfragen"
 
 USER_AGENT = "wdr-kleineanfrage/0.1 (+contact: jan.eggers@fm.wdr.de)"
@@ -79,9 +80,12 @@ COLUMNS = [
     "Drucksache_Antwort_Nr",       # primary key
     "Anfrager",
     "Fraktion",
-    "Anfragedatum",
+    "Anfragedatum",          # canonical: seit 2026-05-11 PDF-Briefdatum (Datum des Originals);
+                             # DB-Fallback wenn PDF-Datum fehlt. Wird von cmd_merge befüllt.
     "Anfragetitel",
-    "Antwortdatum",
+    "Antwortdatum",          # idem, PDF-Briefdatum mit DB-Fallback.
+    "Anfragedatum_DB",       # urspr. DB-Drucksachen-Datum, preserved für Korridor-Verifikation.
+    "Antwortdatum_DB",       # idem für Antwort.
     "Ministerium",
     "Systematik",
     "Schlagworte",
@@ -147,9 +151,12 @@ class Record:
     drucksache_antwort_nr: str = ""        # "18/1006" — primary key
     anfrager: str = ""                     # "; "-joined for co-signers
     fraktion: str = ""
-    anfragedatum: str = ""                 # ISO YYYY-MM-DD
+    anfragedatum: str = ""                 # canonical: PDF-Briefdatum (Datum des Originals);
+                                           # DB-Fallback wenn PDF fehlt. ISO YYYY-MM-DD.
     anfragetitel: str = ""
-    antwortdatum: str = ""                 # ISO
+    antwortdatum: str = ""                 # idem.
+    anfragedatum_db: str = ""              # ursprüngliches DB-Drucksachen-Datum, preserved.
+    antwortdatum_db: str = ""              # idem.
     ministerium: str = ""
     systematik: str = ""                   # "; "-joined
     schlagworte: str = ""                  # "; "-joined
@@ -448,6 +455,8 @@ _FIELD_TO_COL = {
     "anfragedatum": "Anfragedatum",
     "anfragetitel": "Anfragetitel",
     "antwortdatum": "Antwortdatum",
+    "anfragedatum_db": "Anfragedatum_DB",
+    "antwortdatum_db": "Antwortdatum_DB",
     "ministerium": "Ministerium",
     "systematik": "Systematik",
     "schlagworte": "Schlagworte",
@@ -2471,63 +2480,47 @@ def _classify_mismatch(rec: "Record", parsed: dict) -> tuple[list[str], bool]:
             return None
 
     for f in flags:
-        if f == "antwortdatum":
-            pdf_v = parsed.get("antwortdatum", "")
-            db_v = rec.antwortdatum or ""
+        if f in ("antwortdatum", "anfragedatum"):
+            # Seit 2026-05-11: PDF-Briefdatum (Datum des Originals aus
+            # datum_original.xlsx, in parsed['<kind>_pdf']) ist Autorität.
+            # cmd_merge hat rec.<kind> bereits gesetzt: PDF wenn Jahr in Range,
+            # sonst DB-Fallback. classify schreibt nur die erklärende Notiz,
+            # rollback nur im Jahres-Tippfehler-Fall (rec.<kind> = DB).
+            kind_short = "Antwortdatum" if f == "antwortdatum" else "Anfragedatum"
+            pdf_v = parsed.get(f + "_pdf", "")
+            db_v = (rec.antwortdatum_db if f == "antwortdatum" else rec.anfragedatum_db) or ""
             y = parse_year(pdf_v)
             if y is not None and not (2015 <= y <= 2030):
                 notes.append(
-                    f"PDF-Antwortdatum '{pdf_v}' = pdftotext-OCR-Glitch "
-                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' maßgeblich.")
+                    f"PDF-{kind_short} '{pdf_v}' = pdftotext-OCR-Glitch "
+                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' bleibt maßgeblich.")
                 continue
             dd = signed_days(pdf_v, db_v) if pdf_v and db_v else None
             if dd is None:
+                # Kein Vergleich möglich (z.B. PDF fehlt). Notiz, kein Rollback.
+                if pdf_v or db_v:
+                    notes.append(
+                        f"{kind_short}: PDF='{pdf_v}', DB='{db_v}' — "
+                        f"unvollständig, keine automatische Auflösung.")
+                    continue
                 return notes, False
-            if 0 < dd <= 122:
-                notes.append(
-                    f"Antwortdatum-Diff {dd}d (PDF '{pdf_v}' = Briefdatum, "
-                    f"DB '{db_v}' = Drucksachen-/Veröff.-Datum); beide legitim.")
-                continue
             if 360 <= abs(dd) <= 370:
+                # Jahres-Tippfehler im PDF: rec.<kind> wurde von merge auf PDF
+                # gesetzt → rollback auf DB.
+                if f == "antwortdatum":
+                    rec.antwortdatum = db_v
+                else:
+                    rec.anfragedatum = db_v
                 notes.append(
-                    f"PDF-Antwortdatum '{pdf_v}' = Jahres-Tippfehler (Diff {dd}d); "
-                    f"DB '{db_v}' maßgeblich.")
+                    f"PDF-{kind_short} '{pdf_v}' = Jahres-Tippfehler "
+                    f"(Diff {dd}d); rollback auf DB '{db_v}'.")
                 continue
-            return notes, False
-
-        elif f == "anfragedatum":
-            pdf_v = parsed.get("anfragedatum", "")
-            db_v = rec.anfragedatum or ""
-            y = parse_year(pdf_v)
-            if y is not None and not (2015 <= y <= 2030):
-                notes.append(
-                    f"PDF-Anfragedatum '{pdf_v}' = pdftotext-OCR-Glitch "
-                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' maßgeblich.")
-                continue
-            dd = signed_days(pdf_v, db_v) if pdf_v and db_v else None
-            if dd is None:
-                return notes, False
-            if 0 < dd <= 122:
-                notes.append(
-                    f"Anfragedatum-Diff {dd}d (PDF '{pdf_v}' = Datum auf "
-                    f"Anfrage-Schreiben, DB '{db_v}' = Drucksachen-Datum); "
-                    f"beide legitim.")
-                continue
-            if 360 <= abs(dd) <= 370:
-                notes.append(
-                    f"PDF-Anfragedatum '{pdf_v}' = Jahres-Tippfehler "
-                    f"(Diff {dd}d); DB '{db_v}' maßgeblich.")
-                continue
-            # Out of corridor: still trust DB (officielle Suche), classify as
-            # OCR/Tippfehler im PDF — hands-off the row only if completely
-            # unparseable.
-            if pdf_v:
-                notes.append(
-                    f"Anfragedatum-Diff (PDF '{pdf_v}' vs DB '{db_v}') "
-                    f"außerhalb Drucksache↔Brief-Korridor; DB maßgeblich "
-                    f"(PDF vermutlich OCR/Tippfehler).")
-                continue
-            return notes, False
+            # Outside-corridor real diff: PDF bleibt maßgeblich (steht bereits
+            # in rec.<kind>); Notiz dokumentiert den ersetzten DB-Wert.
+            notes.append(
+                f"{kind_short}: war (DB) '{db_v}', jetzt (PDF, Datum des "
+                f"Originals) '{pdf_v}' — Diff {dd}d, außerhalb Korridor.")
+            continue
 
         elif f == "drucksache_anfrage_nr":
             pdf_v = parsed.get("drucksache_anfrage_nr", "")
@@ -2640,6 +2633,7 @@ def _cmd_resolve_auto(args: argparse.Namespace) -> int:
     """
     xlsx = Path(args.xlsx)
     rows = load_index(xlsx)
+    pdf_dates = _load_pdf_dates()
     targets = [r for r in rows.values()
                if r.datenqualitaet == "ask_review" and not r.notizen]
     print(f"resolve --auto: {len(targets)} ask_review-Zeilen ohne Notiz",
@@ -2653,6 +2647,9 @@ def _cmd_resolve_auto(args: argparse.Namespace) -> int:
             if md.exists():
                 head = md.read_text(encoding="utf-8", errors="replace")[:16000]
                 parsed = _parse_pdf_header_fields(head)
+        # Datums-Klassifikation greift auf PDF-Briefdatum (datum_original.xlsx) zu.
+        parsed["anfragedatum_pdf"] = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+        parsed["antwortdatum_pdf"] = pdf_dates.get((rec.drucksache_antwort_nr, "Antwort"), "")
         notes, ok = _classify_mismatch(rec, parsed)
         if ok and notes:
             if not args.dry_run:
@@ -2691,7 +2688,8 @@ def _cmd_resolve_interactive(args: argparse.Namespace) -> int:
               f"WP{rec.wp} KA {rec.kleine_anfrage_nr}  {rec.fraktion}")
         print(f"  Titel : {rec.anfragetitel[:100]}")
         print(f"  Anfrager (DB): {rec.anfrager}")
-        print(f"  Anfragedatum DB: {rec.anfragedatum}   Antwortdatum DB: {rec.antwortdatum}")
+        print(f"  Anfragedatum (canon): {rec.anfragedatum} (DB war: {rec.anfragedatum_db})")
+        print(f"  Antwortdatum (canon): {rec.antwortdatum} (DB war: {rec.antwortdatum_db})")
         print(f"  Drucksache_Anfrage DB: {rec.drucksache_anfrage_nr}")
         print(f"  Mismatch_Flags: {rec.mismatch_flags}")
         # Re-parse PDF for the user's reference
@@ -2700,7 +2698,7 @@ def _cmd_resolve_interactive(args: argparse.Namespace) -> int:
             if md.exists():
                 head = md.read_text(encoding="utf-8", errors="replace")[:16000]
                 parsed = _parse_pdf_header_fields(head)
-                print(f"  PDF says — Anfragedatum: {parsed['anfragedatum']}, "
+                print(f"  PDF-Header — Anfragedatum: {parsed['anfragedatum']}, "
                       f"Antwortdatum: {parsed['antwortdatum']}, "
                       f"Drucksache_Anfrage: {parsed['drucksache_anfrage_nr']}, "
                       f"Fraktion: {parsed['fraktion']}")
@@ -2960,16 +2958,89 @@ def _parse_pdf_header_fields(head: str) -> dict:
     return out
 
 
+def _load_pdf_dates(path: Path = DATUM_ORIGINAL_XLSX) -> dict[tuple[str, str], str]:
+    """Return {(Drucksache_Nr, 'Anfrage'|'Antwort'): Datum_Original (ISO)}.
+
+    Quelle ist `tools/extract_datum_original.py` → `data/datum_original.xlsx`.
+    Nur Status=ok-Zeilen mit nicht-leerem `Datum_Original` werden übernommen.
+    Leere Map (kein Crash) wenn Datei fehlt — `cmd_merge` weicht dann auf
+    DB-Datum aus.
+    """
+    if not path.exists():
+        return {}
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None)
+    if header is None:
+        wb.close()
+        return {}
+    hidx = {h: i for i, h in enumerate(header) if h is not None}
+    need = {"Drucksache_Nr", "Anfrage_oder_Antwort", "Datum_Original", "Status"}
+    if not need.issubset(hidx):
+        wb.close()
+        return {}
+    out: dict[tuple[str, str], str] = {}
+    for row in rows_iter:
+        status = row[hidx["Status"]] if row[hidx["Status"]] is not None else ""
+        if status != "ok":
+            continue
+        ds = row[hidx["Drucksache_Nr"]]
+        kind = row[hidx["Anfrage_oder_Antwort"]]
+        datum = row[hidx["Datum_Original"]]
+        if isinstance(ds, str) and isinstance(kind, str) and isinstance(datum, str) and datum:
+            out[(ds, kind)] = datum
+    wb.close()
+    return out
+
+
+def _reconcile_date(pdf_v: str, db_v: str, kind: str) -> tuple[str, str]:
+    """Entscheide PDF-Briefdatum vs DB-Drucksachen-Datum für eine Spalte.
+
+    Returns (chosen_iso, flag) — flag = `kind` ('anfragedatum' / 'antwortdatum')
+    wenn die Zeile in Mismatch_Flags wandern soll, sonst "".
+
+    Policy seit 2026-05-11 (vgl. SKILL.md):
+      - PDF leer / unparseable → DB (Fallback), kein Flag.
+      - DB leer → PDF (kein Vergleich möglich), kein Flag.
+      - identisch → PDF (egal), kein Flag.
+      - PDF-Jahr außerhalb [2015,2030] → DB (PDF = Parse-Artefakt), Flag.
+      - Korridor (PDF früher 0–122d, beide Jahre in Range) → PDF, kein Flag (silent).
+      - sonst → PDF (= neue Autorität), Flag für ask_review.
+    """
+    if not pdf_v:
+        return db_v, ""
+    if not db_v:
+        return pdf_v, ""
+    if pdf_v == db_v:
+        return pdf_v, ""
+    try:
+        pdf_d = date.fromisoformat(pdf_v)
+        db_d = date.fromisoformat(db_v)
+    except ValueError:
+        return db_v, ""  # unparseable → fall back to DB silently
+    if not (2015 <= pdf_d.year <= 2030):
+        return db_v, kind  # PDF parse-artefact: DB wins, flag for note
+    dd = (db_d - pdf_d).days
+    if 0 <= dd <= 122:
+        return pdf_v, ""  # corridor: silent PDF takeover
+    return pdf_v, kind  # outside corridor: PDF authority but flag
+
+
 def _date_mismatch(pdf_v: str, db_v: str) -> bool:
     """True wenn Datums-Diff ein echter Mismatch ist (nicht der erwartete
     Drucksachen-↔-Brief-Verarbeitungs-Lag).
 
-    Akzeptiert ohne Flag:
+    Used by `cmd_verify` (read-only report). Akzeptiert ohne Flag:
       - Diff 0–122d in PDF-früher-Richtung (DB = Drucksachen-/Veröff.-Datum,
         PDF = Brief-/Anfrage-Schreibdatum).
     Flagged:
       - Diff > 122d, Diff in DB-früher-Richtung > 14d, Jahres-Tippfehler
         (~365d), OCR-Glitch (Jahr außerhalb [2015, 2030]).
+
+    Hinweis: `cmd_merge` nutzt seit 2026-05-11 statt dieser Funktion
+    `_reconcile_date(pdf, db, kind)`, das den Korridor in dieselbe Richtung
+    auswertet, aber PDF als neue Autorität setzt.
     """
     if not pdf_v or not db_v or pdf_v == db_v:
         return False
@@ -2989,18 +3060,17 @@ def _date_mismatch(pdf_v: str, db_v: str) -> bool:
 
 
 def _detect_mismatches(rec: Record, head: str) -> list[str]:
-    """Return field-names where DB ↔ PDF disagree for one row.
+    """Return PDF-Header-vs-DB-mismatches für Nicht-Datums-Felder.
 
-    Used by both verify (read-only report) and merge (persist into
-    Mismatch_Flags column). Datum-Toleranz: 0–122d in PDF-früher-Richtung
-    (Drucksache↔Brief-Lag), 14d in DB-früher-Richtung (Original-Schwelle).
+    Datums-Mismatches sind seit 2026-05-11 NICHT mehr hier — die werden in
+    `cmd_merge` direkt anhand `datum_original.xlsx` (PDF-Briefdatum) gegen
+    `rec.anfragedatum_db`/`antwortdatum_db` reconciled. Diese Funktion deckt
+    nur noch `fraktion`, `drucksache_anfrage_nr`, `md_kanr` ab.
+
+    Used by verify (read-only report) und merge (persist in Mismatch_Flags).
     """
     flags: list[str] = []
     parsed = _parse_pdf_header_fields(head)
-    if _date_mismatch(parsed["anfragedatum"], rec.anfragedatum):
-        flags.append("anfragedatum")
-    if _date_mismatch(parsed["antwortdatum"], rec.antwortdatum):
-        flags.append("antwortdatum")
     if (parsed["drucksache_anfrage_nr"] and rec.drucksache_anfrage_nr
             and parsed["drucksache_anfrage_nr"] != rec.drucksache_anfrage_nr):
         flags.append("drucksache_anfrage_nr")
@@ -3032,42 +3102,85 @@ _MANUAL_TAGS = {
 def cmd_merge(args: argparse.Namespace) -> int:
     """Persist DB ↔ PDF cross-check verdict on every row.
 
-    For each row with status=extracted, re-parse the PDF header and write:
-      - Mismatch_Flags: ","-joined field names where DB ↔ PDF differ
-      - Datenqualität: ok / korrigiert / ask_review
+    Zwei Pfade:
+      1. **Datums-Reconciliation** (PDF-Briefdatum aus `datum_original.xlsx`
+         vs DB-Drucksachen-Datum aus `*_DB`-Spalten): seit 2026-05-11 ist
+         PDF-Briefdatum die Autoritätsquelle. Innerhalb Korridor (0–122d PDF
+         früher) wird PDF stillschweigend in `Anfragedatum`/`Antwortdatum`
+         geschrieben. Außerhalb → Mismatch_Flag, ask_review. PDF-Parse-
+         Artefakt (Jahr außerhalb [2015,2030]) → DB bleibt + Flag.
+      2. **Header-Cross-Check** für `fraktion` / `drucksache_anfrage_nr` /
+         `md_kanr` aus dem PDF-Header gegen DB-Werte — unverändert.
 
-    'korrigiert' = a manual-correction tag is set in Extract_Flags AND no
-    open mismatch remains. 'ask_review' = at least one mismatch outstanding.
+    Migration: beim ersten Lauf werden vorhandene Anfragedatum/Antwortdatum
+    nach `*_DB` kopiert (DB-Wert preservieren), bevor PDF überschreibt.
+
+    Datenqualität: 'ok' / 'korrigiert' (manueller Tag oder bestehende Notiz)
+    / 'ask_review' (offener Mismatch). 'korrigiert' bleibt sticky.
     """
     xlsx = Path(args.xlsx)
     rows = load_index(xlsx)
-    counters = {"ok": 0, "korrigiert": 0, "ask_review": 0, "skipped": 0}
+    pdf_dates = _load_pdf_dates()
+    if not pdf_dates:
+        print(
+            f"merge: WARNUNG — {DATUM_ORIGINAL_XLSX} fehlt/leer; Datums-"
+            f"Reconciliation übersprungen (DB-Werte bleiben in index.xlsx).",
+            file=sys.stderr,
+        )
+    counters = {"ok": 0, "korrigiert": 0, "ask_review": 0, "skipped": 0,
+                "datum_pdf_silent": 0, "datum_pdf_flagged": 0,
+                "datum_pdf_missing": 0, "datum_db_migrated": 0}
 
     for key, rec in rows.items():
-        if rec.antworttext_status != STATUS_EXTRACTED or not rec.antworttext:
-            rec.mismatch_flags = ""
+        # Migration: DB-Werte einmalig in *_DB sichern, bevor PDF überschreibt.
+        if not rec.anfragedatum_db and rec.anfragedatum:
+            rec.anfragedatum_db = rec.anfragedatum
+            counters["datum_db_migrated"] += 1
+        if not rec.antwortdatum_db and rec.antwortdatum:
+            rec.antwortdatum_db = rec.antwortdatum
+
+        # Datums-Reconciliation gegen PDF-Briefdatum (datum_original.xlsx).
+        date_flags: list[str] = []
+        pdf_anfrage = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+        pdf_antwort = pdf_dates.get((rec.drucksache_antwort_nr, "Antwort"), "")
+        new_anfrage, flag_a = _reconcile_date(pdf_anfrage, rec.anfragedatum_db, "anfragedatum")
+        new_antwort, flag_b = _reconcile_date(pdf_antwort, rec.antwortdatum_db, "antwortdatum")
+        rec.anfragedatum = new_anfrage
+        rec.antwortdatum = new_antwort
+        for f, pdf_v, db_v in (
+            (flag_a, pdf_anfrage, rec.anfragedatum_db),
+            (flag_b, pdf_antwort, rec.antwortdatum_db),
+        ):
+            if f:
+                date_flags.append(f)
+                counters["datum_pdf_flagged"] += 1
+            elif pdf_v and db_v and pdf_v != db_v:
+                counters["datum_pdf_silent"] += 1
+            elif not pdf_v and db_v:
+                counters["datum_pdf_missing"] += 1
+
+        # Header-Cross-Check: nur wenn .md vorhanden.
+        non_date_flags: list[str] = []
+        if rec.antworttext_status == STATUS_EXTRACTED and rec.antworttext:
+            md_path = REPO_ROOT / rec.antworttext
+            if md_path.exists():
+                try:
+                    head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
+                    non_date_flags = _detect_mismatches(rec, head)
+                except OSError:
+                    pass
+        all_flags = date_flags + non_date_flags
+        rec.mismatch_flags = ",".join(all_flags)
+
+        existing_tags = {t.strip() for t in (rec.extract_flags or "").split(",") if t.strip()}
+        has_manual = bool(existing_tags & _MANUAL_TAGS)
+        has_notiz = bool((rec.notizen or "").strip())
+        if rec.antworttext_status != STATUS_EXTRACTED and not all_flags:
+            # Kein extrahierter Antworttext und keine Datums-Flags → skipped
             rec.datenqualitaet = ""
             counters["skipped"] += 1
             continue
-        md_path = REPO_ROOT / rec.antworttext
-        if not md_path.exists():
-            counters["skipped"] += 1
-            continue
-        try:
-            head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
-        except OSError:
-            counters["skipped"] += 1
-            continue
-        flags = _detect_mismatches(rec, head)
-        rec.mismatch_flags = ",".join(flags)
-        existing_tags = {t.strip() for t in (rec.extract_flags or "").split(",") if t.strip()}
-        has_manual = bool(existing_tags & _MANUAL_TAGS)
-        # Eine nicht-leere Notiz ist eine erledigte Mismatch-Triage
-        # (resolve --auto / --interactive / Hand). Die bleibt 'korrigiert',
-        # auch wenn _detect_mismatches nach Toleranz-Update keinen Flag mehr
-        # findet — sonst geht der resolve-Trail verloren.
-        has_notiz = bool((rec.notizen or "").strip())
-        if flags:
+        if all_flags:
             rec.datenqualitaet = "korrigiert" if has_notiz else "ask_review"
             counters["korrigiert" if has_notiz else "ask_review"] += 1
         elif has_manual or has_notiz:
@@ -3080,7 +3193,10 @@ def cmd_merge(args: argparse.Namespace) -> int:
     save_index(rows, xlsx)
     print(
         f"merge done: ok={counters['ok']} korrigiert={counters['korrigiert']} "
-        f"ask_review={counters['ask_review']} skipped={counters['skipped']}",
+        f"ask_review={counters['ask_review']} skipped={counters['skipped']}\n"
+        f"  Datum: PDF silent={counters['datum_pdf_silent']} "
+        f"flagged={counters['datum_pdf_flagged']} pdf_missing={counters['datum_pdf_missing']} "
+        f"db_migrated={counters['datum_db_migrated']}",
         file=sys.stderr,
     )
     return 0

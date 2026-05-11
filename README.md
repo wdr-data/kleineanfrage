@@ -30,18 +30,38 @@ Pipeline, Verb-Liste, pandas-Snippets und Resolve-Heuristik stehen in **`skills/
 
 ## Datenqualität
 
-Primärquelle ist die [Anfragen-Datenbank des Landtags](https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html); sie enthält die wesentlichen Informationen zum Wer, was und wann. In dieser Datenbank wird auf die parlamentarischen Dokumente verlinkt - PDFs, die kleinere Tippfehler und Widersprüche enthalten, die im Index weitgehend bereinigt sind.
+Primärquelle ist die [Anfragen-Datenbank des Landtags](https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html); sie enthält die wesentlichen Informationen zum Wer, Was und Wann und verlinkt auf die parlamentarischen Dokumente. Die DB liefert den größeren Teil der Metadaten; die PDFs sind die Quelle für alles, was die DB kappt oder nicht enthält — sie liefern auch die maßgeblichen Daten zum Anfrage- und Antwortzeitpunkt (siehe „Datenmodell" unten).
 
-Wie jede Datenbank enthält die NRW-Landtagsdatenbank kleine Fehler - resultierend aus Tipp- und Zuordnungsfehlern und unklaren Bezugspunkten. **Insgesamt ist die Datenqualität aber gut** - die Datenbank mit dem Dokument-Index verdient am meisten Vertrauen (und wird deshalb im ersten Schritt in eine Tabelle `data/db_index.xlsx` geklont).
+Wie jede Datenbank enthält die NRW-Landtagsdatenbank kleine Fehler — Tipp- und Zuordnungsfehler, unklare Bezugspunkte. **Insgesamt ist die Datenqualität gut**; die DB wird im ersten Schritt als `data/db_index.xlsx` eingefroren und bleibt Referenz.
 
-Diese kleineren Probleme sind aufgefallen:
+Diese typischen Lücken kennt der Skill und schließt sie aus den PDFs:
 
-- Es ist nicht ganz klar, was die Datenbank als Antwortdatum auflistet - streng genommen ist das das Antwortdatum des jeweiligen Ministeriums ("...mit Schreiben vom x.y." aus den PDFs).
-- Der Index enthält maximal zwei Abgeordnete hinter einer parlamentarischen Anfrage; tatsächlich können in einer solchen Anfrage aber deutlich mehr Abgeordnete genannt sein (bei der SPD einmal 69). Das wird in der Datenbank durch "... u.a." gekennzeichnet und muss aus den PDFs ergänzt werden (Spalte `Anfrager_Alle`).
-- Es wird immer nur das federführende Ministerium genannt, keine weiteren, die an der Antwort beteiligt waren (Spalte `Beteiligte_Ministerien_Kuerzel` ergänzt das aus den PDFs).
-- In mindestens zwei Fällen stehen in der Datenbank Links auf Dokumente, die es doppelt gibt - unter unterschiedlichen Dokumentnummern.
+- Der Index nennt maximal zwei Abgeordnete pro Anfrage; tatsächlich können viel mehr beteiligt sein (bei der SPD einmal 69). Markiert mit „… u.a.", ergänzt in Spalte `Anfrager_Alle`.
+- Nur das federführende Ministerium steht im Index; die weiteren beteiligten Ressorts kommen aus dem PDF-Antworttext (`Beteiligte_Ministerien_Kuerzel`).
+- Anfrage- und Antwortdatum: die DB führt das Drucksachen-Veröffentlichungsdatum, das PDF das tatsächliche Briefdatum („Datum des Originals: …" auf Seite 1). Letzteres ist die maßgebliche Größe — die Pipeline schreibt es in `Anfragedatum`/`Antwortdatum` und hält das DB-Datum in `Anfragedatum_DB`/`Antwortdatum_DB` zur Verifikation fest.
+- In mindestens zwei Fällen verlinkt die DB auf Dokumente, die doppelt unter unterschiedlichen Drucksachen-Nummern existieren.
 
-All dies konnte der Agent selbsttätig auflösen.
+All dies löst der Agent selbsttätig auf.
+
+## Datenmodell — drei Quellen, eine Zieltabelle
+
+| Datei | Inhalt | Domain |
+|---|---|---|
+| `data/db_index.xlsx` | eingefrorener Snapshot der Landtagsdatenbank-Suche (Anfrager, Fraktion, Titel, Systematik, Ministerium, Drucksachen-Daten). Verifikations-Referenz. | nur `landtag.py crawl` |
+| `data/datum_original.xlsx` | PDF-Briefdaten („Datum des Originals: DD.MM.YYYY") + „Ausgegeben"-Datum pro Drucksache, sowohl Anfrage als auch Antwort. **Autoritative Datums-Quelle.** | nur `tools/extract_datum_original.py` |
+| `data/index.xlsx` | Arbeits-Tabelle: DB-Metadaten + PDF-Datumswerte + PDF-Anreicherungen + Qualitäts-Spalten. Antwort an Auswertungs-Tools. | alle Pipeline-Verben |
+
+### Wie das Datum geprüft wird
+
+PDF-Briefdatum und DB-Drucksachen-Datum unterscheiden sich fast immer — die Drucksache wird typischerweise einige Tage nach dem Schreiben veröffentlicht. `landtag.py merge` joinst beide Werte und entscheidet:
+
+- **Korridor** (0–122 Tage, PDF früher, beide Jahre 2015–2026): erwartbarer Verarbeitungs-Lag → PDF-Datum wird stillschweigend in `index.xlsx` übernommen, keine Flag.
+- **Außerhalb Korridor** (große Differenz, Jahres-Tippfehler, OCR-Glitch im PDF): Zeile wird mit `Datenqualität=ask_review` markiert. `resolve --auto` arbeitet eine Heuristik-Tabelle ab — in der Regel gewinnt das PDF-Datum, bei klarem PDF-Parse-Fehler (Jahr außerhalb 2015–2030 oder Jahres-Tippfehler) fällt die Heuristik auf das DB-Datum zurück. Die jeweils ersetzten Werte landen als „war (DB): …" oder „war (PDF): …" in `Notizen`.
+- **PDF fehlt** (`pdf_missing`, `no_match` in `datum_original.xlsx`): DB-Datum bleibt als Fallback in `index.xlsx`.
+
+### Pipeline in einem Satz
+
+`crawl` → `fetch-text` → `scan-archive` → `extract-multi-ministerium` → `build-abgeordnete-index` → `extract-all-anfrager` (Doppelpass) → `extract_datum_original.py` → `merge` → `resolve --auto` → `verify`. Volle Befehlsliste in `skills/landtag-nrw-extraction/SKILL.md`.
 
 ## Der eine Eingriff von Hand...
 
@@ -68,10 +88,12 @@ Die Tabellen werden ins Verzeichnis `data/` geschrieben, in Unterverzeichnisse f
 
 ```
 landtag.py                                   ← gesamte Logik (eine Datei)
+tools/extract_datum_original.py              ← liest „Datum des Originals" aus allen PDFs
 requirements.txt
-Archiv/                                      ← PDF-Cache (~18.000 Dateien, gitignored)
+Archiv/                                      ← PDF-Cache (~28.000 Dateien Anfrage+Antwort, gitignored)
 data/db_index.xlsx                           ← immutable DB-Snapshot (nur von `crawl` geschrieben)
-data/index.xlsx                              ← Working-File: DB + PDF-Anreicherung + Datenqualität
+data/datum_original.xlsx                     ← PDF-Briefdaten je Drucksache (autoritative Datums-Quelle)
+data/index.xlsx                              ← Working-File: DB-Metadaten + PDF-Anreicherung + Datenqualität
 data/*.log                                   ← Extraktions-/Crawl-Fehler, Vokabel-Neulinge
 skills/landtag-nrw-extraction/SKILL.md       ← Skill-Definition für Agenten (Kern)
 skills/landtag-nrw-extraction/edge-cases.md  ← Quirks, PDF-Tippfehler, Sonderfälle

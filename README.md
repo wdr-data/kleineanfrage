@@ -2,7 +2,7 @@
 
 Strukturierte Daten zu **Kleinen Anfragen** des Landtags Nordrhein-Westfalen lokal extrahieren — Metadaten in einer Excel-Datei, Antworttexte als Markdown neben den Original-PDFs.
 
-Wer hat wann was gefragt - und welches Ministerium hat wie schnell geantwortet? Die Daten aus der Datenbank - und die Verweise auf die Volltexte - landen in einer Excel-Tabelle (`data/index.xlsx`), die eine weitere Auswertung erlaubt.
+**Wer hat wann was gefragt - und welches Ministerium hat wie schnell geantwortet?** Die Daten aus der Datenbank - und die Verweise auf die Volltexte - landen in einer Excel-Tabelle (`data/index.xlsx`), die eine weitere Auswertung erlaubt.
 
 In diesem Repository findet sich:
 
@@ -14,10 +14,10 @@ In diesem Repository findet sich:
 
 Ein "Skill" ist ein Paket für einen KI-Agenten wie Claude Code, mit dem er eine Aufgabe lösen können soll:
 
-- **Werkzeuge**, die die KI einsetzen kann, um die Aufgabe zu lösen
+- **Werkzeuge**, also Programme, die die KI einsetzen kann, um die Aufgabe zu lösen
 - **prozedurales und Hintergrundwissen** - gewissermaßen die Betriebsanleitung zu den Tools.
 
-Einen Skill kann man zu Beginn einer Claude-Code-Session wie ein Zusatzmodul laden - es ist im Prinzip eine Art langer System Prompt, der das Sprachmodell auf seine Aufgabe vorbereitet. In unserem Fall: saubere Daten über Kleine Anfragen in NRW gewinnen.
+Einen Skill kann man zu Beginn einer Claude-Code-Session wie ein Zusatzmodul laden - es ist im Prinzip eine Art langer System-Prompt, der das Sprachmodell auf seine Aufgabe vorbereitet. In unserem Fall: saubere Daten über Kleine Anfragen in NRW gewinnen.
 
 ## Wie man den Skill benutzt
 
@@ -28,17 +28,40 @@ Einen Skill kann man zu Beginn einer Claude-Code-Session wie ein Zusatzmodul lad
 
 Pipeline, Verb-Liste, pandas-Snippets und Resolve-Heuristik stehen in **`skills/landtag-nrw-extraction/SKILL.md`**.
 
+## Wie die Laufzeit einer Anfrage definiert wird
+
+An sich ist es ganz einfach:
+
+- Ein/e Abgeordnete/r stellt am Tag X eine Kleine Anfrage an die Landesregierung.
+- Am Tag Y antwortet ein Ministerium, wofür es meist andere Ministerien eingebunden hat.
+- Die Laufzeit der Kleinen Anfrage: Y-X <= 28 Tage. (So die gesetzliche Vorgabe.)
+
+X und Y sind definiert als der Tag, an dem die Anfrage (bzw. die Antwort darauf) **auf der landeseigenen Datenaustausch-Plattform hochgeladen ist**.
+
+Praktisch ist das Datum aber nicht so leicht herauszufinden: In der Datenbank und den PDFs finden sich unterschiedlichste Datumsangaben.
+
+- Im Datenbank-Index stehen das Datum der Anfrage und das Datum der Antwort.
+- Auf jedem PDF steht auf Seite 1 ein "Datum des Originals"
+- Die Antworten der Ministerien beginnen immer mit einem Seitenkopf: "Antwort der Landesregierung auf die Kleine Anfrage <nr> vom <Datum>". Außerdem enthält der Seitenkopf ein weiteres Mal das Datum des Antwortdokuments.
+
+Leider sind diese Datumsangaben nicht immer deckungsgleich - dazu im nächsten Abschnitt mehr - deswegen ist festgelegt:
+
+- Datum der Anfrage ziehen wir aus dem Seitenkopf der Antwort
+- Datum der Antwort ist das Dokumentendatum (also "Datum des Originals" unten auf Seite 1)
+
+Die anderen Daten werden genutzt, um die Daten zu verifizieren und ggf. zu korrigieren - und das ist dringend nötig.
+
 ## Datenqualität
 
-Primärquelle ist die [Anfragen-Datenbank des Landtags](https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html); sie enthält die wesentlichen Informationen zum Wer, Was und Wann und verlinkt auf die parlamentarischen Dokumente. Die DB liefert den größeren Teil der Metadaten; die PDFs sind die Quelle für alles, was die DB kappt oder nicht enthält — und für die maßgeblichen Daten zum Anfrage- und Antwortzeitpunkt (siehe „Datenmodell" unten).
+Wie jede Datenbank enthalten die NRW-Landtagsdatenbank und die PDFs kleine Fehler — Tipp- und Zuordnungsfehler, unklare Bezugspunkte.
 
-Wie jede Datenbank enthält die NRW-Landtagsdatenbank kleine Fehler — Tipp- und Zuordnungsfehler, unklare Bezugspunkte. **Insgesamt ist die Datenqualität gut**; die DB wird im ersten Schritt als `data/db_index.xlsx` eingefroren und bleibt Referenz.
+**Insgesamt ist die Datenqualität gut**; die DB wird im ersten Schritt als `data/db_index.xlsx` eingefroren und bleibt Referenz.
 
 Diese typischen Lücken kennt der Skill und schließt sie aus den PDFs:
 
+- Wie erwähnt sind die Daten, die in der Datenbank stehen, nicht ganz richtig - sie scheinen die Veröffentlichung durch den Landtag zu markieren und sind nicht immer mit den oben genannten Anfrage- und Antwortdaten deckungsgleich.
 - Der Index nennt maximal zwei Abgeordnete pro Anfrage; tatsächlich können viel mehr beteiligt sein (bei der SPD einmal 69). Markiert mit „… u.a.", ergänzt in Spalte `Anfrager_Alle`.
 - Nur das federführende Ministerium steht im Index; die weiteren beteiligten Ressorts kommen aus dem PDF-Antworttext (`Beteiligte_Ministerien_Kuerzel`).
-- Anfrage- und Antwortdatum: die DB führt das Drucksachen-Veröffentlichungsdatum, die maßgeblichen Daten liegen aber in den PDFs — siehe Datenmodell.
 - In mindestens zwei Fällen verlinkt die DB auf Dokumente, die doppelt unter unterschiedlichen Drucksachen-Nummern existieren.
 
 All dies löst der Agent selbsttätig auf.

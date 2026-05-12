@@ -32,8 +32,6 @@ data/index.xlsx.bak.*
 
 # work-in-progress, not yet for the public repo
 skill-revision.md
-tools/
-data/db_index.xlsx
 
 # editors
 .vscode/
@@ -41,8 +39,11 @@ data/db_index.xlsx
 .Rproj.user
 .positai
 
-# Konzept
+# Konzept (lokal); historische Design-Specs sind als Ausnahme getrackt
 docs/
+!docs/superpowers/
+!docs/superpowers/specs/
+!docs/superpowers/specs/*.md
 
 # Journalistisch
 texte/

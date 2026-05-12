@@ -39,11 +39,12 @@ skill-revision.md
 .Rproj.user
 .positai
 
-# Konzept (lokal); historische Design-Specs sind als Ausnahme getrackt
-docs/
-!docs/superpowers/
-!docs/superpowers/specs/
-!docs/superpowers/specs/*.md
+# Konzept (lokal); historische Design-Specs in docs/superpowers/specs/
+# bleiben getrackt — alles andere in docs/ ist lokal.
+docs/*
+!docs/superpowers
+docs/superpowers/*
+!docs/superpowers/specs
 
 # Journalistisch
 texte/

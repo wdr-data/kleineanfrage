@@ -32,7 +32,9 @@ WAHLPERIODEN <- c(17,18)
 GRANULARITY <- "month" # monatsweise summieren; Gruppierung nach Woche zu verrauscht
 CUTOFF <- "2026-03-24"
 FRIST_TAGE <- 28
-TOP_N_THEMEN <- 30
+TOP_N_THEMEN <- 20 # Für die Gesamtauswertung: Was waren die Topthemen?
+TOP_N_THEMEN2 <- 20 # Auswertung nach Fraktionen: Cut nach 20 Topthemen
+N_TOP <- 5
 
 # Hilfsfunktion: HTML-Entities dekodieren (vektorisiert, NA-sicher)
 decode_html <- function(x) {
@@ -95,7 +97,9 @@ anfragen_alle_df <- read.xlsx(fname) %>%
   # Rausziehen, was noch läuft oder was zurückgezogen wurde
   filter(!str_detect(Antworttext_Status,"pending")) %>% 
   filter(!str_detect(Antworttext_Status,"anfrage_zurueckgezogen")) %>% 
-  filter(!str_detect(Antworttext_Status,"abbruch"))
+  filter(!str_detect(Antworttext_Status,"abbruch")) %>% 
+  # Keine Anfragen nach dem CUTOFF-Datum berücksichtigen. 
+  filter(Anfragedatum <= CUTOFF) 
 
 # Der Haupt-Loop: 
 # Wahlperioden werden einzeln aufgeschlüsselt.  
@@ -103,8 +107,7 @@ anfragen_alle_df <- read.xlsx(fname) %>%
 for (wp in WAHLPERIODEN) {
   anfragen_df <- anfragen_alle_df %>% 
     # Wahlperiode filtern
-    filter(WP==wp) %>% 
-    filter(Anfragedatum <= CUTOFF) 
+    filter(WP==wp) 
   
     # Verspätung nach Ministerium
     
@@ -154,6 +157,14 @@ for (wp in WAHLPERIODEN) {
     # Verspätung nach Abgeordneten
     
     abgeordnete_df <- anfragen_df %>% 
+      # Kompatibilität: Inzwischen haben wir entdeckt, dass
+      # in der Datenbank nur die ersten beiden Abgeordneten auf 
+      # einem Antrag stehen. Kein Problem, der Skill kratzt die
+      # anderen aus den PDFs und gleicht sie mit der Abgeordneten-Referenz ab, 
+      # das Ergebnis steht semikolon-separiert in "Anfrager_Alle".
+      # Rüberkopieren, die Original_Anfrager brauchen wir nicht
+      mutate(Anfrager = Anfrager_Alle) %>% 
+      
       # Inkorrekte Trennzeichen fixen
       mutate(Anfrager = str_replace(Anfrager," \\, ","; ")) %>% 
       # Reingerutsche Parteikürzel extrahieren
@@ -227,16 +238,18 @@ for (wp in WAHLPERIODEN) {
       # Jetzt aufsummieren
       fraktion_themen_df <- sachgebiete(anfragen_df %>% 
                                           filter(Fraktion == f)) %>% 
-      ungroup() %>% 
-      group_by(Sachgebiet) %>% 
-      mutate(sum_zeit = Zeit * Anzahl) %>%  # Zum Aufsummieren
-      summarize(
-        WP = first(WP),
-        Anzahl = sum(Anzahl,na.rm=T),
-        Zeit = sum(sum_zeit, na.rm=T ) / sum(Anzahl, na.rm=T),
-        Verspätet = sum(Verspätet)
-      ) %>% 
-      arrange(desc(Anzahl)) 
+        ungroup() %>% 
+        group_by(Sachgebiet) %>% 
+        mutate(sum_zeit = Zeit * Anzahl) %>%  # Zum Aufsummieren
+        summarize(
+          WP = first(WP),
+          Anzahl = sum(Anzahl,na.rm=T),
+          Zeit = sum(sum_zeit, na.rm=T ) / sum(Anzahl, na.rm=T),
+          Verspätet = sum(Verspätet)
+        ) %>% 
+        arrange(desc(Anzahl)) %>% 
+        # Top 20 reichen
+        slice_head(n=TOP_N_THEMEN2)
       
       # Schreiben
       write.xlsx(fraktion_themen_df,
@@ -324,17 +337,21 @@ write.xlsx(anfragen_zeitreihe_df,
            "data/ALLE_zeitreihe.xlsx",
            overwrite=T)
 
-# 3 längste, 3 schnellste
+# N_TOP längste, N_TOP schnellste
 extreme_df <- anfragen_alle_df %>% 
-  filter(wp=="18") %>% 
+  filter(WP=="18") %>% 
   arrange(desc(Antwortzeit)) %>% 
-  slice_head(n=3) %>% 
+  slice_head(n=N_TOP) %>% 
   bind_rows(anfragen_alle_df %>% 
-              filter(wp=="18") %>% 
+              filter(WP=="18") %>% 
               filter(!is.na(Antwortzeit)) %>% 
               arrange(desc(Antwortzeit)) %>% 
-              slice_tail(n=3)) %>% 
-  select(wp,Kleine_Anfrage_Nr,Anfrager,Anfragedatum,Anfragetitel,Antwortdatum,
+              slice_tail(n=N_TOP)) %>% 
+  select(WP,Kleine_Anfrage_Nr,
+         Anfrager,
+         Fraktion_Canonical,
+         Anfragedatum,Anfragetitel,
+         Antwortdatum,
          Ministerium_Kuerzel,Beteiligte_Ministerien_Kuerzel,
          Beteiligte_Ministerien,Antwortzeit,
          Link_Drucksache_Anfrage,
@@ -342,4 +359,36 @@ extreme_df <- anfragen_alle_df %>%
 
 write.xlsx(extreme_df,"data/WP18/WP18_extremwerte.xlsx")
 
-    
+übersicht_df <- anfragen_alle_df %>% 
+  summarize(Anzahl = as.integer(n()),
+            Zeit_Tage =mean(Antwortzeit, na.rm=T),
+            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+  ) %>% 
+  mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
+  pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
+
+wp18_übersicht_df <- anfragen_alle_df %>% 
+  filter(WP==18) %>% 
+  summarize(Anzahl = as.integer(n()),
+            Zeit_Tage =mean(Antwortzeit, na.rm=T),
+            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+  ) %>% 
+  mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
+  pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
+
+
+write.xlsx(wp18_übersicht_df,"data/WP18/wp18_uebersicht.xlsx")
+
+wp17_übersicht_df <- anfragen_alle_df %>% 
+  filter(WP==17) %>% 
+  summarize(Anzahl = as.integer(n()),
+            Zeit_Tage =mean(Antwortzeit, na.rm=T),
+            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+  ) %>% 
+  mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
+  pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
+
+
+write.xlsx(wp17_übersicht_df,"data/WP17/wp17_uebersicht.xlsx")
+
+

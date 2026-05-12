@@ -32,7 +32,7 @@ import argparse
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -57,22 +57,35 @@ from landtag import (  # noqa: E402
 OUT_XLSX = DATA_DIR / "datum_original.xlsx"
 
 # "Datum des Originals: 21.09.2022/Ausgegeben: 28.09.2022"
-# Toleriert variable Whitespaces, optionalen "Ausgegeben"-Teil und beide Trenner (/ oder ;).
+# Toleranzen:
+#   - variable Whitespaces
+#   - optionaler "Ausgegeben"-Teil
+#   - Trenner / oder ;
+#   - Tag/Monat-Separator: Punkt ODER Leerzeichen (pdftotext rendert in manchen
+#     Schrift-Embeddings den Punkt als Space, z. B. "03 07.2025").
 _RX_DATUM_ORIGINAL = re.compile(
     r"Datum\s+des\s+Originals\s*:\s*"
-    r"(?P<original>\d{1,2}\.\d{1,2}\.\d{2,4})"
-    r"(?:\s*[/;]\s*Ausgegeben\s*:\s*(?P<ausgegeben>\d{1,2}\.\d{1,2}\.\d{2,4}))?"
+    r"(?P<original>\d{1,2}[. ]\d{1,2}[. ]\d{2,4})"
+    r"(?:\s*[/;]\s*Ausgegeben\s*:\s*(?P<ausgegeben>\d{1,2}[. ]\d{1,2}[. ]\d{2,4}))?"
 )
 
 
-def _to_iso(s: str) -> str:
-    """'21.09.2022' → '2022-09-21'. Empty on parse fail."""
-    m = re.match(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})$", s.strip())
+def _to_iso(s: str, fallback_year: int | None = None) -> str:
+    """'21.09.2022' → '2022-09-21'. Empty on parse fail.
+
+    fallback_year heilt 4-stellige PDF-Tippfehler im Jahr (z. B. '0205' statt
+    '2025'): wenn das geparste Jahr außerhalb [2000,2099] liegt UND ein
+    plausibles Fallback-Jahr (typischerweise das Ausgegeben-Jahr derselben
+    Datums-Zeile) übergeben wird, ersetzt das Fallback das Tippfehler-Jahr.
+    """
+    m = re.match(r"(\d{1,2})[. ]\s*(\d{1,2})[. ]\s*(\d{2,4})$", s.strip())
     if not m:
         return ""
     d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if y < 100:
         y += 2000  # bestätige 2-stellige Jahre als 20xx
+    if not (2000 <= y <= 2099) and fallback_year and 2000 <= fallback_year <= 2099:
+        y = fallback_year  # PDF-Year-Glitch via Ausgegeben-Jahr heilen
     if not (1 <= mo <= 12 and 1 <= d <= 31 and 2000 <= y <= 2099):
         return ""
     return f"{y:04d}-{mo:02d}-{d:02d}"
@@ -97,10 +110,28 @@ def _scan_page_one(pdf_path: Path) -> tuple[str, str, str]:
     m = _RX_DATUM_ORIGINAL.search(text)
     if not m:
         return "no_match", "", ""
-    iso_orig = _to_iso(m.group("original"))
     iso_ausg = _to_iso(m.group("ausgegeben") or "")
+    fallback_y = int(iso_ausg[:4]) if iso_ausg else None
+    iso_orig = _to_iso(m.group("original"), fallback_year=fallback_y)
+    # Year-Typo-Heilung mit Ausgegeben-Cross-Check: typischer Januar-Tippfehler
+    # (Brief im Januar geschrieben, aber „letztes Jahr" eingetragen). Wenn
+    # Ausgegeben deutlich später als Original ist (>60d) und Original+1 Jahr im
+    # erwartbaren Korridor [0,60]d vor Ausgegeben liegt, ist Original-Jahr ein
+    # Tippfehler — applizieren +1 Jahr.
+    if iso_orig and iso_ausg:
+        try:
+            d_orig = date.fromisoformat(iso_orig)
+            d_ausg = date.fromisoformat(iso_ausg)
+            gap = (d_ausg - d_orig).days
+            if gap > 60:
+                d_orig_shifted = d_orig.replace(year=d_orig.year + 1)
+                gap_shifted = (d_ausg - d_orig_shifted).days
+                if 0 <= gap_shifted <= 60:
+                    iso_orig = d_orig_shifted.isoformat()
+        except ValueError:
+            pass  # u. a. Schaltjahres-Edge-Case (29.02 + 1 Jahr) — überspringen
     if not iso_orig:
-        return "parse_failed", "", ""
+        return "parse_failed", "", iso_ausg
     return "ok", iso_orig, iso_ausg
 
 

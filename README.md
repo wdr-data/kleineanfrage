@@ -30,7 +30,7 @@ Pipeline, Verb-Liste, pandas-Snippets und Resolve-Heuristik stehen in **`skills/
 
 ## Datenqualität
 
-Primärquelle ist die [Anfragen-Datenbank des Landtags](https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html); sie enthält die wesentlichen Informationen zum Wer, Was und Wann und verlinkt auf die parlamentarischen Dokumente. Die DB liefert den größeren Teil der Metadaten; die PDFs sind die Quelle für alles, was die DB kappt oder nicht enthält — sie liefern auch die maßgeblichen Daten zum Anfrage- und Antwortzeitpunkt (siehe „Datenmodell" unten).
+Primärquelle ist die [Anfragen-Datenbank des Landtags](https://www.landtag.nrw.de/home/dokumente/dokumentensuche/anfragen-und-antworten.html); sie enthält die wesentlichen Informationen zum Wer, Was und Wann und verlinkt auf die parlamentarischen Dokumente. Die DB liefert den größeren Teil der Metadaten; die PDFs sind die Quelle für alles, was die DB kappt oder nicht enthält — und für die maßgeblichen Daten zum Anfrage- und Antwortzeitpunkt (siehe „Datenmodell" unten).
 
 Wie jede Datenbank enthält die NRW-Landtagsdatenbank kleine Fehler — Tipp- und Zuordnungsfehler, unklare Bezugspunkte. **Insgesamt ist die Datenqualität gut**; die DB wird im ersten Schritt als `data/db_index.xlsx` eingefroren und bleibt Referenz.
 
@@ -38,7 +38,7 @@ Diese typischen Lücken kennt der Skill und schließt sie aus den PDFs:
 
 - Der Index nennt maximal zwei Abgeordnete pro Anfrage; tatsächlich können viel mehr beteiligt sein (bei der SPD einmal 69). Markiert mit „… u.a.", ergänzt in Spalte `Anfrager_Alle`.
 - Nur das federführende Ministerium steht im Index; die weiteren beteiligten Ressorts kommen aus dem PDF-Antworttext (`Beteiligte_Ministerien_Kuerzel`).
-- Anfrage- und Antwortdatum: die DB führt das Drucksachen-Veröffentlichungsdatum, das PDF das tatsächliche Briefdatum („Datum des Originals: …" auf Seite 1). Letzteres ist die maßgebliche Größe — die Pipeline schreibt es in `Anfragedatum`/`Antwortdatum` und hält das DB-Datum in `Anfragedatum_DB`/`Antwortdatum_DB` zur Verifikation fest.
+- Anfrage- und Antwortdatum: die DB führt das Drucksachen-Veröffentlichungsdatum, die maßgeblichen Daten liegen aber in den PDFs — siehe Datenmodell.
 - In mindestens zwei Fällen verlinkt die DB auf Dokumente, die doppelt unter unterschiedlichen Drucksachen-Nummern existieren.
 
 All dies löst der Agent selbsttätig auf.
@@ -47,21 +47,44 @@ All dies löst der Agent selbsttätig auf.
 
 | Datei | Inhalt | Domain |
 |---|---|---|
-| `data/db_index.xlsx` | eingefrorener Snapshot der Landtagsdatenbank-Suche (Anfrager, Fraktion, Titel, Systematik, Ministerium, Drucksachen-Daten). Verifikations-Referenz. | nur `landtag.py crawl` |
-| `data/datum_original.xlsx` | PDF-Briefdaten („Datum des Originals: DD.MM.YYYY") + „Ausgegeben"-Datum pro Drucksache, sowohl Anfrage als auch Antwort. **Autoritative Datums-Quelle.** | nur `tools/extract_datum_original.py` |
-| `data/index.xlsx` | Arbeits-Tabelle: DB-Metadaten + PDF-Datumswerte + PDF-Anreicherungen + Qualitäts-Spalten. Antwort an Auswertungs-Tools. | alle Pipeline-Verben |
+| `data/db_index.xlsx` | eingefrorener Snapshot der Landtags-DB-Suche (Anfrager, Fraktion, Titel, Systematik, Ministerium, Drucksachen-Daten). Verifikations-Referenz. | nur `landtag.py crawl` |
+| `data/datum_original.xlsx` | PDF-Briefdaten („Datum des Originals: DD.MM.YYYY") + Ausgegeben-Datum je Drucksache, Anfrage und Antwort getrennt. Plausibilitäts-Referenz. | nur `tools/extract_datum_original.py` |
+| `data/index.xlsx` | Arbeits-Tabelle: DB-Metadaten + canonical PDF-Daten + Anreicherungen + Qualitäts-Spalten. Eingang für R-Auswertung. | alle Pipeline-Verben |
+
+### Wo welches Datum herkommt
+
+Für jede Kleine Anfrage existieren bis zu drei Daten-Lesarten — die Pipeline führt die plausibelste in `index.xlsx` und hält die Verifikations-Quellen daneben:
+
+| Spalte | Primärquelle | Bedeutung |
+|---|---|---|
+| `Anfragedatum` | **Antwort-PDF, Body**: „auf die Kleine Anfrage X **vom `<Datum>`**" | Der Tag, den die Landesregierung in ihrer eigenen Antwort als Anfragedatum nennt — die offiziell anerkannte Lesart |
+| `Antwortdatum` | **Antwort-PDF, Footer Seite 1**: „Datum des Originals: …" | Briefdatum des Ministeriums (Unterschrift) |
+| `Anfragedatum_DB`, `Antwortdatum_DB` | Drucksachen-Veröffentlichungs­datum aus DB | Verifikations-Referenz, bleibt unverändert |
+
+Zusätzlich wird das **Anfrage-PDF-Footer-Datum** („Datum des Originals" auf dem Anfrage-Schreiben) aus `datum_original.xlsx` als dritte Quelle herangezogen — nicht in `index.xlsx` direkt, aber im Notizen-Audit jeder Datums-Korrektur.
 
 ### Wie das Datum geprüft wird
 
-PDF-Briefdatum und DB-Drucksachen-Datum unterscheiden sich fast immer — die Drucksache wird typischerweise einige Tage nach dem Schreiben veröffentlicht. `landtag.py merge` joinst beide Werte und entscheidet:
+`landtag.py merge` rekonziliiert mit Korridor-Heuristik [-14d, +122d] gegen das DB-Datum: das deckt sowohl den Brief-vs-Drucksachen-Lag als auch den Registrierungs-Lag ab. Innerhalb Korridor → silent take-over, keine Flag. Außerhalb → `Datenqualität=ask_review`.
 
-- **Korridor** (0–122 Tage, PDF früher, beide Jahre 2015–2026): erwartbarer Verarbeitungs-Lag → PDF-Datum wird stillschweigend in `index.xlsx` übernommen, keine Flag.
-- **Außerhalb Korridor** (große Differenz, Jahres-Tippfehler, OCR-Glitch im PDF): Zeile wird mit `Datenqualität=ask_review` markiert. `resolve --auto` arbeitet eine Heuristik-Tabelle ab — in der Regel gewinnt das PDF-Datum, bei klarem PDF-Parse-Fehler (Jahr außerhalb 2015–2030 oder Jahres-Tippfehler) fällt die Heuristik auf das DB-Datum zurück. Die jeweils ersetzten Werte landen als „war (DB): …" oder „war (PDF): …" in `Notizen`.
-- **PDF fehlt** (`pdf_missing`, `no_match` in `datum_original.xlsx`): DB-Datum bleibt als Fallback in `index.xlsx`.
+`resolve --auto` schließt den Rest mit drei Plausibilitäts-Mustern für `Anfragedatum`, die alle drei Quellen kreuzprüfen:
+
+- **Body matcht DB** im Korridor → Body bleibt maßgeblich, Anfrage-Footer-Tippfehler wird notiert.
+- **Footer matcht DB** im Korridor, Body weicht > 14 d ab → Body hat Tippfehler, `Anfragedatum` wird auf den Footer-Wert gesetzt (rollback).
+- **Body ≈ N × 365 d** von DB und Footer entfernt (Jahr-Tippfehler im Body, N = 1–5) → rollback auf DB.
+- **Body-Jahr außerhalb [2015, 2030]** (OCR-Glitch) → DB-Fallback (durch merge bereits gesetzt), Notiz dokumentiert.
+
+Für `Antwortdatum` ist die Heuristik klassisch: Jahr-Tippfehler oder OCR-Glitch → DB gewinnt; sonst bleibt das PDF-Briefdatum maßgeblich.
+
+Jede Datums-Korrektur-Notiz listet alle drei Quellen explizit: `Quellen: DB='…' | Antwort-Body='…' | Anfrage-PDF-Footer='…'`. Das macht den Audit-Trail vollständig nachvollziehbar.
+
+- **PDF fehlt** (`pdf_missing`, `no_match` in `datum_original.xlsx`): DB-Datum bleibt als Fallback.
+- **Manuelle Adoption**: Tags `anfragedatum_manual` / `antwortdatum_manual` in `Extract_Flags` sperren die Reconcile (für Fälle, die kein Pattern zuverlässig fängt — z. B. wenn Body und Footer beide das falsche Jahr nennen).
+- **Datenqualität `review`** ist sticky: ein expliziter „bitte schauen"-Marker, der auch nach merge/resolve-Re-Runs erhalten bleibt, bis ein Mensch ihn räumt.
 
 ### Pipeline in einem Satz
 
-`crawl` → `fetch-text` → `scan-archive` → `extract-multi-ministerium` → `build-abgeordnete-index` → `extract-all-anfrager` (Doppelpass) → `extract_datum_original.py` → `merge` → `resolve --auto` → `verify`. Volle Befehlsliste in `skills/landtag-nrw-extraction/SKILL.md`.
+`crawl` → `fetch-text` → `scan-archive` → `extract-multi-ministerium` → `build-abgeordnete-index` → `extract-all-anfrager` (Doppelpass) → `tools/extract_datum_original.py` → `merge` → `resolve --auto` → `verify`. Volle Befehlsliste in `skills/landtag-nrw-extraction/SKILL.md`.
 
 ## Der eine Eingriff von Hand...
 

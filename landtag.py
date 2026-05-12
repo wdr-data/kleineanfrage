@@ -2479,47 +2479,95 @@ def _classify_mismatch(rec: "Record", parsed: dict) -> tuple[list[str], bool]:
         except Exception:
             return None
 
+    def _anfragedatum_sources(db_v: str) -> str:
+        """Format Anfragedatum-Notizen-Suffix mit allen drei Quellen."""
+        body_v = parsed.get("anfragedatum_body", "")
+        foot_v = parsed.get("anfragedatum_pdf_orig", "")
+        return (f"Quellen: DB='{db_v or '-'}' | "
+                f"Antwort-Body='{body_v or '-'}' | "
+                f"Anfrage-PDF-Footer='{foot_v or '-'}'")
+
     for f in flags:
         if f in ("antwortdatum", "anfragedatum"):
-            # Seit 2026-05-11: PDF-Briefdatum (Datum des Originals aus
-            # datum_original.xlsx, in parsed['<kind>_pdf']) ist Autorität.
-            # cmd_merge hat rec.<kind> bereits gesetzt: PDF wenn Jahr in Range,
-            # sonst DB-Fallback. classify schreibt nur die erklärende Notiz,
-            # rollback nur im Jahres-Tippfehler-Fall (rec.<kind> = DB).
+            # Seit 2026-05-11: PDF ist Autorität. cmd_merge hat rec.<kind>
+            # bereits gesetzt; classify schreibt nur die erklärende Notiz,
+            # Rollback nur im Jahres-Tippfehler / OCR-Glitch-Fall.
+            # Anfragedatum-Notizen listen alle drei Quellen (DB, Antwort-Body,
+            # Anfrage-PDF-Footer) für vollständige Audit-Spur.
             kind_short = "Antwortdatum" if f == "antwortdatum" else "Anfragedatum"
             pdf_v = parsed.get(f + "_pdf", "")
             db_v = (rec.antwortdatum_db if f == "antwortdatum" else rec.anfragedatum_db) or ""
             y = parse_year(pdf_v)
             if y is not None and not (2015 <= y <= 2030):
-                notes.append(
-                    f"PDF-{kind_short} '{pdf_v}' = pdftotext-OCR-Glitch "
-                    f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' bleibt maßgeblich.")
+                if f == "anfragedatum":
+                    notes.append(
+                        f"Anfragedatum: Antwort-Body '{pdf_v}' = OCR-Glitch "
+                        f"(Jahr {y} außerhalb [2015,2030]); maßgeblich: DB "
+                        f"'{db_v}'. {_anfragedatum_sources(db_v)}.")
+                else:
+                    notes.append(
+                        f"PDF-{kind_short} '{pdf_v}' = pdftotext-OCR-Glitch "
+                        f"(Jahr {y} außerhalb [2015,2030]); DB '{db_v}' bleibt maßgeblich.")
                 continue
             dd = signed_days(pdf_v, db_v) if pdf_v and db_v else None
             if dd is None:
-                # Kein Vergleich möglich (z.B. PDF fehlt). Notiz, kein Rollback.
                 if pdf_v or db_v:
-                    notes.append(
-                        f"{kind_short}: PDF='{pdf_v}', DB='{db_v}' — "
-                        f"unvollständig, keine automatische Auflösung.")
+                    if f == "anfragedatum":
+                        notes.append(
+                            f"Anfragedatum: unvollständige Daten, keine "
+                            f"automatische Auflösung. {_anfragedatum_sources(db_v)}.")
+                    else:
+                        notes.append(
+                            f"{kind_short}: PDF='{pdf_v}', DB='{db_v}' — "
+                            f"unvollständig, keine automatische Auflösung.")
                     continue
                 return notes, False
             if 360 <= abs(dd) <= 370:
-                # Jahres-Tippfehler im PDF: rec.<kind> wurde von merge auf PDF
-                # gesetzt → rollback auf DB.
                 if f == "antwortdatum":
                     rec.antwortdatum = db_v
+                    notes.append(
+                        f"PDF-{kind_short} '{pdf_v}' = Jahres-Tippfehler "
+                        f"(Diff {dd}d); rollback auf DB '{db_v}'.")
                 else:
                     rec.anfragedatum = db_v
-                notes.append(
-                    f"PDF-{kind_short} '{pdf_v}' = Jahres-Tippfehler "
-                    f"(Diff {dd}d); rollback auf DB '{db_v}'.")
+                    notes.append(
+                        f"Anfragedatum: Antwort-Body = Jahres-Tippfehler "
+                        f"(Diff {dd}d zu DB); rollback auf DB '{db_v}'. "
+                        f"{_anfragedatum_sources(db_v)}.")
                 continue
-            # Outside-corridor real diff: PDF bleibt maßgeblich (steht bereits
-            # in rec.<kind>); Notiz dokumentiert den ersetzten DB-Wert.
-            notes.append(
-                f"{kind_short}: war (DB) '{db_v}', jetzt (PDF, Datum des "
-                f"Originals) '{pdf_v}' — Diff {dd}d, außerhalb Korridor.")
+            # Body-Typo (Anfragedatum): Anfrage-PDF-Footer matcht DB im
+            # Korridor, Body weicht stärker ab → Body hat Tippfehler, Footer
+            # ist verlässlich. Adoption: rec.anfragedatum = Footer.
+            if f == "anfragedatum":
+                foot_v = parsed.get("anfragedatum_pdf_orig", "")
+                dd_fd = signed_days(foot_v, db_v) if foot_v and db_v else None
+                if dd_fd is not None and -14 <= dd_fd <= 14:
+                    rec.anfragedatum = foot_v
+                    notes.append(
+                        f"Anfragedatum: Antwort-Body '{pdf_v}' = Tippfehler "
+                        f"(Diff {dd}d zu DB); Anfrage-PDF-Footer '{foot_v}' "
+                        f"stimmt mit DB '{db_v}' im Korridor überein → "
+                        f"übernehmen aus Footer. "
+                        f"{_anfragedatum_sources(db_v)}.")
+                    continue
+            # Outside-corridor real diff: PDF bleibt maßgeblich.
+            if f == "anfragedatum":
+                if "anfragedatum_pdf_kreuz" in flags:
+                    # Cross-Flag-Branch hat die vollständige Analyse (Body
+                    # vs Footer vs DB); deren Verdict gilt. Hier nur
+                    # Platzhalter-Notiz, damit len(notes)==len(flags).
+                    notes.append(
+                        f"Anfragedatum: Diff {dd}d zu DB außerhalb Korridor "
+                        f"— Verdict siehe Cross-Diff-Notiz.")
+                else:
+                    notes.append(
+                        f"Anfragedatum: Antwort-Body '{pdf_v}' bleibt maßgeblich "
+                        f"(Diff {dd}d zu DB, außerhalb Korridor). "
+                        f"{_anfragedatum_sources(db_v)}.")
+            else:
+                notes.append(
+                    f"{kind_short}: war (DB) '{db_v}', jetzt (PDF, Datum des "
+                    f"Originals) '{pdf_v}' — Diff {dd}d, außerhalb Korridor.")
             continue
 
         elif f == "drucksache_anfrage_nr":
@@ -2618,6 +2666,100 @@ def _classify_mismatch(rec: "Record", parsed: dict) -> tuple[list[str], bool]:
                 continue
             return notes, False
 
+        elif f == "anfragedatum_pdf_kreuz":
+            body_v = parsed.get("anfragedatum_body", "")
+            foot_v = parsed.get("anfragedatum_pdf_orig", "")
+            db_v   = rec.anfragedatum_db or ""
+            body_y = parse_year(body_v)
+            dd_bf = signed_days(body_v, foot_v) if body_v and foot_v else None
+            dd_bd = signed_days(body_v, db_v) if body_v and db_v else None
+            # Body-Year-Glitch (Jahr außerhalb [2015,2030]) — anfragedatum-
+            # Branch hat bereits DB als maßgeblich gesetzt; Cross-Diff ist
+            # Folge derselben OCR-Störung.
+            if body_y is not None and not (2015 <= body_y <= 2030):
+                notes.append(
+                    f"Anfragedatum: Antwort-Body-Year-Glitch ({body_y}); "
+                    f"Cross-Diff zur Anfrage-PDF-Footer ist Folge dieses "
+                    f"OCR-Fehlers. {_anfragedatum_sources(db_v)}.")
+                continue
+            # Single-Year-Typo im Body: body ~1J vom DB UND footer entfernt.
+            if (dd_bf is not None and 360 <= abs(dd_bf) <= 370
+                    and dd_bd is not None and 360 <= abs(dd_bd) <= 370):
+                rec.anfragedatum = db_v
+                notes.append(
+                    f"Anfragedatum: Antwort-Body = Year-Typo (≈365d von DB "
+                    f"und Anfrage-PDF-Footer entfernt); rollback auf DB "
+                    f"'{db_v}'. {_anfragedatum_sources(db_v)}.")
+                continue
+            # Multi-Year-Typo (2–5 Jahre off): body N×365d von DB UND footer
+            # entfernt, beide DB und footer untereinander identisch oder
+            # innerhalb 14d. Klassisch: getipptes Jahr falsch (z. B. 2026
+            # statt 2023).
+            if (dd_bd is not None and dd_bf is not None
+                    and 700 <= abs(dd_bd) <= 5*370
+                    and 700 <= abs(dd_bf) <= 5*370
+                    and abs(dd_bd - dd_bf) <= 14):
+                rec.anfragedatum = db_v
+                yrs = round(abs(dd_bd) / 365)
+                notes.append(
+                    f"Anfragedatum: Antwort-Body = Year-Typo (≈{yrs}J von "
+                    f"DB und Anfrage-PDF-Footer entfernt, beide DB+Footer "
+                    f"konsistent); rollback auf DB '{db_v}'. "
+                    f"{_anfragedatum_sources(db_v)}.")
+                continue
+            # Body matcht DB im Korridor → Footer hat den Typo; Body bleibt.
+            if dd_bd is not None and -14 <= dd_bd <= 14:
+                notes.append(
+                    f"Anfragedatum: Antwort-Body '{body_v}' maßgeblich "
+                    f"(stimmt mit DB im Korridor, Diff {dd_bd}d); Anfrage-"
+                    f"PDF-Footer weicht um {dd_bf}d ab (Tippfehler im "
+                    f"Anfrage-PDF). {_anfragedatum_sources(db_v)}.")
+                continue
+            # Footer matcht DB im Korridor, Body weicht von beiden ab → Body
+            # hat Tippfehler, Footer ist verlässlich.
+            dd_fd = signed_days(foot_v, db_v) if foot_v and db_v else None
+            if (dd_fd is not None and -14 <= dd_fd <= 14
+                    and dd_bd is not None and abs(dd_bd) > 14):
+                # rec.anfragedatum bereits in anfragedatum-Branch auf Footer
+                # gesetzt (falls anfragedatum-Flag auch da). Sonst hier.
+                if rec.anfragedatum != foot_v:
+                    rec.anfragedatum = foot_v
+                notes.append(
+                    f"Anfragedatum: Antwort-Body '{body_v}' = Tippfehler "
+                    f"(Diff {dd_bd}d zu DB, {dd_bf}d zu Footer); Anfrage-"
+                    f"PDF-Footer '{foot_v}' stimmt mit DB '{db_v}' überein → "
+                    f"übernehmen aus Footer. {_anfragedatum_sources(db_v)}.")
+                continue
+            return notes, False
+
+        elif f == "antwortdatum_pdf_kreuz":
+            # Antwort-PDF-Body ("mit Schreiben vom <Datum>") vs Antwort-PDF-
+            # Footer ("Datum des Originals"). Body matcht DB → Footer hat
+            # Tippfehler → Body adoptieren.
+            body_v = parsed.get("antwortdatum", "")
+            foot_v = parsed.get("antwortdatum_pdf", "")
+            db_v   = rec.antwortdatum_db or ""
+            dd_bf = signed_days(body_v, foot_v) if body_v and foot_v else None
+            dd_bd = signed_days(body_v, db_v) if body_v and db_v else None
+            if dd_bd is not None and -14 <= dd_bd <= 14:
+                rec.antwortdatum = body_v
+                notes.append(
+                    f"Antwortdatum: Antwort-PDF-Footer '{foot_v}' = "
+                    f"Tippfehler (Diff {dd_bf}d zu Body); Antwort-Body "
+                    f"'{body_v}' (Schreiben vom …) stimmt mit DB '{db_v}' "
+                    f"überein → Body adoptiert.")
+                continue
+            # Footer matcht DB, Body off → Body hat Typo, Footer bleibt.
+            dd_fd = signed_days(foot_v, db_v) if foot_v and db_v else None
+            if (dd_fd is not None and -14 <= dd_fd <= 14
+                    and dd_bd is not None and abs(dd_bd) > 14):
+                notes.append(
+                    f"Antwortdatum: Antwort-Body '{body_v}' = Tippfehler "
+                    f"(Diff {dd_bd}d zu DB); Antwort-PDF-Footer '{foot_v}' "
+                    f"stimmt mit DB '{db_v}' überein → Footer bleibt maßgeblich.")
+                continue
+            return notes, False
+
         else:
             return notes, False
 
@@ -2647,8 +2789,15 @@ def _cmd_resolve_auto(args: argparse.Namespace) -> int:
             if md.exists():
                 head = md.read_text(encoding="utf-8", errors="replace")[:16000]
                 parsed = _parse_pdf_header_fields(head)
-        # Datums-Klassifikation greift auf PDF-Briefdatum (datum_original.xlsx) zu.
-        parsed["anfragedatum_pdf"] = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+        # Datums-Klassifikation:
+        #   - anfragedatum_body  = Antwort-PDF-Body "vom <Datum>" (verbindlich)
+        #   - anfragedatum_pdf_orig = Anfrage-PDF-Footer "Datum des Originals"
+        #   - anfragedatum_pdf   = canonical (body bevorzugt, sonst footer) —
+        #     wird für den anfragedatum-Korridor-Check gegen DB benutzt.
+        #   - antwortdatum_pdf   = Antwort-PDF-Footer "Datum des Originals"
+        parsed["anfragedatum_body"] = parsed.get("anfragedatum", "")
+        parsed["anfragedatum_pdf_orig"] = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+        parsed["anfragedatum_pdf"] = parsed["anfragedatum_body"] or parsed["anfragedatum_pdf_orig"]
         parsed["antwortdatum_pdf"] = pdf_dates.get((rec.drucksache_antwort_nr, "Antwort"), "")
         notes, ok = _classify_mismatch(rec, parsed)
         if ok and notes:
@@ -3005,7 +3154,10 @@ def _reconcile_date(pdf_v: str, db_v: str, kind: str) -> tuple[str, str]:
       - DB leer → PDF (kein Vergleich möglich), kein Flag.
       - identisch → PDF (egal), kein Flag.
       - PDF-Jahr außerhalb [2015,2030] → DB (PDF = Parse-Artefakt), Flag.
-      - Korridor (PDF früher 0–122d, beide Jahre in Range) → PDF, kein Flag (silent).
+      - Korridor (PDF früher 0–122d ODER DB früher 0–14d, beide Jahre in
+        Range) → PDF, kein Flag (silent). Die PDF-früher-Seite deckt das
+        Brief-vs-Drucksachen-Lag (Antwortdatum) ab; die DB-früher-Seite
+        deckt das Registrierungs-Lag (Anfragedatum-Body) ab.
       - sonst → PDF (= neue Autorität), Flag für ask_review.
     """
     if not pdf_v:
@@ -3022,7 +3174,7 @@ def _reconcile_date(pdf_v: str, db_v: str, kind: str) -> tuple[str, str]:
     if not (2015 <= pdf_d.year <= 2030):
         return db_v, kind  # PDF parse-artefact: DB wins, flag for note
     dd = (db_d - pdf_d).days
-    if 0 <= dd <= 122:
+    if -14 <= dd <= 122:
         return pdf_v, ""  # corridor: silent PDF takeover
     return pdf_v, kind  # outside corridor: PDF authority but flag
 
@@ -3096,6 +3248,16 @@ def _detect_mismatches(rec: Record, head: str) -> list[str]:
 _MANUAL_TAGS = {
     "anfrager_manual", "anfrager_pdf_typo", "anfrager_from_db",
     "anfrager_cross_fraktion", "pdf_database_mismatch",
+    "anfragedatum_manual", "antwortdatum_manual",
+}
+
+# Tags die signalisieren, dass das entsprechende Datums-Feld manuell
+# adoptiert wurde (typischerweise via index_fixed-Diff oder PDF-Year-Typo
+# Cross-Validation) — `cmd_merge` überspringt die Reconcile für markierte
+# Felder, damit der manuell gesetzte Wert nicht durch PDF überschrieben wird.
+_DATUM_MANUAL_TAGS = {
+    "anfragedatum": "anfragedatum_manual",
+    "antwortdatum": "antwortdatum_manual",
 }
 
 
@@ -3139,16 +3301,48 @@ def cmd_merge(args: argparse.Namespace) -> int:
         if not rec.antwortdatum_db and rec.antwortdatum:
             rec.antwortdatum_db = rec.antwortdatum
 
-        # Datums-Reconciliation gegen PDF-Briefdatum (datum_original.xlsx).
+        # Antwort-PDF-Header upfront parsen — liefert das verbindliche
+        # Anfragedatum ("auf die Kleine Anfrage X vom <Datum>" im Body) und
+        # die Felder für den nicht-Datums-Cross-Check.
+        parsed: dict = {"anfragedatum": "", "antwortdatum": "",
+                        "drucksache_anfrage_nr": "", "fraktion": ""}
+        head = ""
+        if rec.antworttext_status == STATUS_EXTRACTED and rec.antworttext:
+            md_path = REPO_ROOT / rec.antworttext
+            if md_path.exists():
+                try:
+                    head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
+                    parsed = _parse_pdf_header_fields(head)
+                except OSError:
+                    pass
+
+        # Datums-Reconciliation. Manuell adoptierte Felder bleiben unangetastet.
+        existing_tags_set = {t.strip() for t in (rec.extract_flags or "").split(",") if t.strip()}
         date_flags: list[str] = []
-        pdf_anfrage = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+
+        # Anfragedatum-Hierarchie:
+        #   1. Antwort-PDF-Body "auf die Kleine Anfrage X vom <Datum>" — verbindlich
+        #   2. Anfrage-PDF-Footer "Datum des Originals" — Fallback wenn (1) fehlt
+        # Kreuzprüfung: wenn beide vorhanden und unterschiedlich, signalisiert
+        # Mismatch_Flag `anfragedatum_pdf_kreuz` einen Tippfehler-Verdacht.
+        pdf_anfrage_orig = pdf_dates.get((rec.drucksache_anfrage_nr, "Anfrage"), "")
+        antwort_body_anfragedatum = parsed.get("anfragedatum", "")
+        canonical_anfrage = antwort_body_anfragedatum or pdf_anfrage_orig
+
         pdf_antwort = pdf_dates.get((rec.drucksache_antwort_nr, "Antwort"), "")
-        new_anfrage, flag_a = _reconcile_date(pdf_anfrage, rec.anfragedatum_db, "anfragedatum")
-        new_antwort, flag_b = _reconcile_date(pdf_antwort, rec.antwortdatum_db, "antwortdatum")
+
+        if _DATUM_MANUAL_TAGS["anfragedatum"] in existing_tags_set:
+            new_anfrage, flag_a = rec.anfragedatum, ""
+        else:
+            new_anfrage, flag_a = _reconcile_date(canonical_anfrage, rec.anfragedatum_db, "anfragedatum")
+        if _DATUM_MANUAL_TAGS["antwortdatum"] in existing_tags_set:
+            new_antwort, flag_b = rec.antwortdatum, ""
+        else:
+            new_antwort, flag_b = _reconcile_date(pdf_antwort, rec.antwortdatum_db, "antwortdatum")
         rec.anfragedatum = new_anfrage
         rec.antwortdatum = new_antwort
         for f, pdf_v, db_v in (
-            (flag_a, pdf_anfrage, rec.anfragedatum_db),
+            (flag_a, canonical_anfrage, rec.anfragedatum_db),
             (flag_b, pdf_antwort, rec.antwortdatum_db),
         ):
             if f:
@@ -3159,28 +3353,76 @@ def cmd_merge(args: argparse.Namespace) -> int:
             elif not pdf_v and db_v:
                 counters["datum_pdf_missing"] += 1
 
-        # Header-Cross-Check: nur wenn .md vorhanden.
-        non_date_flags: list[str] = []
-        if rec.antworttext_status == STATUS_EXTRACTED and rec.antworttext:
-            md_path = REPO_ROOT / rec.antworttext
-            if md_path.exists():
-                try:
-                    head = md_path.read_text(encoding="utf-8", errors="replace")[:16000]
-                    non_date_flags = _detect_mismatches(rec, head)
-                except OSError:
-                    pass
+        # Kreuzprüfung Anfragedatum: Antwort-Body vs Anfrage-PDF-Footer.
+        # Beide stammen aus PDFs; bei normalem Registrierungs-Lag liegt der
+        # Body 1–7d nach dem Footer (Abgeordnete schreibt → Parlament
+        # registriert). Erst Abweichungen > 14d gelten als Tippfehler-
+        # Verdacht und werden geflaggt.
+        if (antwort_body_anfragedatum and pdf_anfrage_orig
+                and antwort_body_anfragedatum != pdf_anfrage_orig
+                and _DATUM_MANUAL_TAGS["anfragedatum"] not in existing_tags_set):
+            try:
+                _d_body = date.fromisoformat(antwort_body_anfragedatum)
+                _d_foot = date.fromisoformat(pdf_anfrage_orig)
+                if abs((_d_body - _d_foot).days) > 14:
+                    date_flags.append("anfragedatum_pdf_kreuz")
+                    counters.setdefault("anfragedatum_kreuz_diff", 0)
+                    counters["anfragedatum_kreuz_diff"] += 1
+            except ValueError:
+                pass
+
+        # Kreuzprüfung Antwortdatum: Antwort-PDF-Body ("mit Schreiben vom
+        # <Datum>") vs Antwort-PDF-Footer ("Datum des Originals"). Beide
+        # sollten exakt das Briefdatum nennen; > 14d auseinander = Tippfehler
+        # in einem der beiden.
+        antwort_body_antwortdatum = parsed.get("antwortdatum", "")
+        if (antwort_body_antwortdatum and pdf_antwort
+                and antwort_body_antwortdatum != pdf_antwort
+                and _DATUM_MANUAL_TAGS["antwortdatum"] not in existing_tags_set):
+            try:
+                _d_body = date.fromisoformat(antwort_body_antwortdatum)
+                _d_foot = date.fromisoformat(pdf_antwort)
+                if abs((_d_body - _d_foot).days) > 14:
+                    date_flags.append("antwortdatum_pdf_kreuz")
+                    counters.setdefault("antwortdatum_kreuz_diff", 0)
+                    counters["antwortdatum_kreuz_diff"] += 1
+            except ValueError:
+                pass
+
+        # Sanity: Antwortdatum vor Anfragedatum ist physisch unmöglich
+        # (Antwort kann nicht vor der Frage stehen) — Flag für manuelle
+        # Sichtung, egal ob via Korridor-Reconcile silent durchgelaufen.
+        if rec.anfragedatum and rec.antwortdatum:
+            try:
+                if date.fromisoformat(rec.antwortdatum) < date.fromisoformat(rec.anfragedatum):
+                    date_flags.append("antwort_vor_anfrage")
+                    counters.setdefault("antwort_vor_anfrage", 0)
+                    counters["antwort_vor_anfrage"] += 1
+            except ValueError:
+                pass
+
+        # Header-Cross-Check (nicht-Datum) — Antwort-PDF-Header gegen DB.
+        non_date_flags: list[str] = _detect_mismatches(rec, head) if head else []
         all_flags = date_flags + non_date_flags
         rec.mismatch_flags = ",".join(all_flags)
 
         existing_tags = {t.strip() for t in (rec.extract_flags or "").split(",") if t.strip()}
         has_manual = bool(existing_tags & _MANUAL_TAGS)
         has_notiz = bool((rec.notizen or "").strip())
+        # `review` ist eine sticky manuelle Priorität (i.d.R. via index_fixed-
+        # Diff gesetzt): bleibt erhalten unabhängig davon, ob neue Flags da
+        # sind — sie signalisiert „Mensch muss draufschauen", auch wenn die
+        # Pipeline intern konsistent ist.
+        was_review = rec.datenqualitaet == "review"
         if rec.antworttext_status != STATUS_EXTRACTED and not all_flags:
-            # Kein extrahierter Antworttext und keine Datums-Flags → skipped
             rec.datenqualitaet = ""
             counters["skipped"] += 1
             continue
-        if all_flags:
+        if was_review:
+            rec.datenqualitaet = "review"
+            counters.setdefault("review", 0)
+            counters["review"] += 1
+        elif all_flags:
             rec.datenqualitaet = "korrigiert" if has_notiz else "ask_review"
             counters["korrigiert" if has_notiz else "ask_review"] += 1
         elif has_manual or has_notiz:

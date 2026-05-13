@@ -475,5 +475,3 @@ wp17_übersicht_df <- anfragen_alle_df %>%
 
 
 write.xlsx(wp17_übersicht_df,"data/WP17/wp17_uebersicht.xlsx")
-
-

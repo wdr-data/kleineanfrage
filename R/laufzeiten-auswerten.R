@@ -56,6 +56,91 @@ n_fraktion <- function(f_v) {
   return (first(f_v))
 }
 
+# Hilfsfunktion: Gesetzliche Feiertage in NRW (brauchen wir gleich noch)
+library(lubridate)
+
+# Ostersonntag nach Gauß'scher Osterformel (vektorisiert)
+# Autor: Claude Opus 4.7
+ostersonntag <- function(jahr) {
+  a <- jahr %% 19
+  b <- jahr %/% 100
+  c <- jahr %% 100
+  d <- b %/% 4
+  e <- b %% 4
+  f <- (b + 8) %/% 25
+  g <- (b - f + 1) %/% 3
+  h <- (19 * a + b - d - g + 15) %% 30
+  i <- c %/% 4
+  k <- c %% 4
+  l <- (32 + 2 * e + 2 * i - h - k) %% 7
+  m <- (a + 11 * h + 22 * l) %/% 451
+  monat <- (h + l - 7 * m + 114) %/% 31
+  tag   <- ((h + l - 7 * m + 114) %% 31) + 1
+  make_date(jahr, monat, tag)
+}
+
+ist_feiertag_nrw <- function(datum) {
+  datum  <- as_date(datum)
+  jahr   <- year(datum)
+  monat  <- month(datum)
+  tag    <- day(datum)
+  ostern <- ostersonntag(jahr)
+  
+  # Feste Feiertage über: Tag und Monat
+  # Bewegliche Feiertage (relativ zum Ostersonntag)
+  neujahr        <- tag == 1 & monat == 1
+  karfreitag    <- datum == ostern - days(2)
+  ostermontag   <- datum == ostern + days(1)
+  tag_der_arbeit <- tag == 1 & monat == 5
+  himmelfahrt   <- datum == ostern + days(39)
+  pfingstmontag <- datum == ostern + days(50)
+  fronleichnam  <- datum == ostern + days(60)
+  tag_der_einheit <- tag == 3 & monat == 10
+  allerheiligen <- monat == 11 & tag == 1
+  weihn1        <- monat == 12 & tag == 25
+  weihn2        <- monat == 12 & tag == 26
+  
+  
+  neujahr | karfreitag | ostermontag | tag_der_arbeit |
+    himmelfahrt | pfingstmontag | fronleichnam |
+    tag_der_einheit | allerheiligen | weihn1 | weihn2
+}
+
+ist_arbeitsfrei_nrw <- function(datum) {
+  datum <- as_date(datum)
+  # Feiertag, Samstag oder Sonntag
+  return (ist_feiertag_nrw(datum) | wday(datum, week_start = 1) >= 6)
+}
+
+# Hilfsfunktion: Frist-Überprüfung mit Feiertagsaufschub. 
+# An sich ist die Prüfung einfach: Eine KA soll innerhalb 28 Tagen
+# beantwortet sein, wobei der erste Tag der Tag der Einreichung ist
+# (Stichtag: Tag des Uploads auf den Dokumentenserver des Landes), 
+# der letzte Tag der Tag, an dem die Antwort auf dem Dokumentenserver landet.
+# Stellt ein Abgeordneter die Frage am Montag, und antwortet das Ministerium
+# am Dienstag, sind das also **2 Tage**.
+#
+# Aaaber: Wenn der letzte Tag der Frist auf einen Samstag oder Feiertag fällt, 
+# gibt es Aufschub bis zum nächsten Werktag. 
+ist_verspätet <- function(Anfrage, Antwort) {
+  # Sicherheitshalber nochmal in ein Lubridate-Datum konvertieren
+  Anfrage <- as_date(Anfrage)
+  Antwort <- as_date(Antwort)
+  # 28 Tage vom 1. April 2025 (Mittwoch) = 28. April (Dienstag):
+  deadline <- Anfrage+FRIST_TAGE-1
+  # Wenn die Antwort an diesem Tag oder davor kommt, ist die Deadline gehalten.
+  # Wenn der Tag auf einen Feiertag oder aufs Wochenende fällt, den ersten
+  # Tag wieder danach. 
+  arbeitsfrei <- ist_arbeitsfrei_nrw(deadline)
+  while (any(arbeitsfrei)) {
+    deadline[arbeitsfrei] <- deadline[arbeitsfrei] + 1
+    arbeitsfrei <- ist_arbeitsfrei_nrw(deadline)
+  }
+  return(Antwort > deadline)
+}
+
+
+
 # Hilfsfunktion: Sachgebiete-Tabelle
 # "Sachgebiete" ist eine kuratierte Schlagwort-Liste, die zwar einige Überschneidungen
 # enthält (z.B. "Arbeit und Beschäftigung" vs. "Arbeitsbedingungen"), aber einen
@@ -75,7 +160,7 @@ sachgebiete <- function(df) {
     summarize(WP = first(WP),
               Anzahl = n(),
               Zeit =mean(Antwortzeit, na.rm=T),
-              Verspätet = sum(Antwortzeit > FRIST_TAGE,na.rm=T),
+              Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
     ) %>% 
     mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100))
   return (sachgebiete_df)
@@ -89,8 +174,8 @@ sachgebiete <- function(df) {
 
 anfragen_alle_df <- read.xlsx(fname) %>% 
   # Daten aufbereiten
-  mutate(Anfragedatum = as.Date(Anfragedatum),
-         Antwortdatum = as.Date(Antwortdatum)) %>%
+  mutate(Anfragedatum = as_date(Anfragedatum),
+         Antwortdatum = as_date(Antwortdatum)) %>%
   mutate(periode = floor_date(Anfragedatum, unit=GRANULARITY)) %>% 
   mutate(Antwortzeit = as.numeric(Antwortdatum - Anfragedatum, units = "days")) %>% 
   mutate(across(where(is.character), decode_html)) %>% 
@@ -117,7 +202,7 @@ for (wp in WAHLPERIODEN) {
         Ministerium = first(Ministerium_Canonical),
         Anzahl = n(),
         Zeit =mean(Antwortzeit, na.rm=T),
-        Verspätet = sum(Antwortzeit > FRIST_TAGE,na.rm=T)
+        Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
       ) %>% 
       arrange(desc(Anzahl)) %>% 
       # Gesamtwert ergänzen
@@ -127,7 +212,7 @@ for (wp in WAHLPERIODEN) {
             Ministerium = "LANDESREGIERUNG GESAMT",
             Anzahl = n(),
             Zeit = mean(Antwortzeit, na.rm=T),
-            Verspätet = sum(Antwortzeit > FRIST_TAGE, na.rm=T),
+            Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
             Ministerium_Kuerzel ="LREG"
           )
       ) %>% 
@@ -145,7 +230,7 @@ for (wp in WAHLPERIODEN) {
       group_by(Fraktion) %>% 
       summarize(Anzahl = n(),
                 Zeit =mean(Antwortzeit, na.rm=T),
-                Verspätet = sum(Antwortzeit > FRIST_TAGE,na.rm =T)
+                Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
       ) %>% 
       mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100)) %>% 
       arrange(desc(Anzahl))
@@ -180,7 +265,7 @@ for (wp in WAHLPERIODEN) {
       summarize(Fraktion = n_fraktion(Fraktion),
                 Anzahl = n(),
                 Zeit =mean(Antwortzeit, na.rm=T),
-                Verspätet = sum(Antwortzeit > FRIST_TAGE,na.rm =T)
+                Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
       ) %>% 
       mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100)) %>% 
       arrange(desc(Anzahl))
@@ -267,7 +352,7 @@ for (wp in WAHLPERIODEN) {
       group_by(Beteiligte_Ministerien) %>% 
       summarize(Anzahl = n(),
                 Zeit = mean(Antwortzeit, na.rm=T),
-                Verspätet = sum(Antwortzeit > FRIST_TAGE)) %>% 
+                Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T)) %>% 
       mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100))
     
     write.xlsx(mitwirkende_df,
@@ -327,7 +412,7 @@ anfragen_zeitreihe_df <- anfragen_alle_df %>%
     WP = first(WP),
     Anzahl = n(),
     Zeit = mean(Antwortzeit, na.rm=T),
-    Verspätet = sum(Antwortzeit > FRIST_TAGE, na.rm=T)
+    Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
   ) %>% 
   mutate(Pünktlichkeitsquote = 100-(Verspätet/Anzahl*100)) %>% 
   arrange(periode) %>% 
@@ -362,7 +447,7 @@ write.xlsx(extreme_df,"data/WP18/WP18_extremwerte.xlsx")
 übersicht_df <- anfragen_alle_df %>% 
   summarize(Anzahl = as.integer(n()),
             Zeit_Tage =mean(Antwortzeit, na.rm=T),
-            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+            Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
   ) %>% 
   mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
   pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
@@ -371,7 +456,7 @@ wp18_übersicht_df <- anfragen_alle_df %>%
   filter(WP==18) %>% 
   summarize(Anzahl = as.integer(n()),
             Zeit_Tage =mean(Antwortzeit, na.rm=T),
-            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+            Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
   ) %>% 
   mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
   pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
@@ -383,7 +468,7 @@ wp17_übersicht_df <- anfragen_alle_df %>%
   filter(WP==17) %>% 
   summarize(Anzahl = as.integer(n()),
             Zeit_Tage =mean(Antwortzeit, na.rm=T),
-            Verspätet = as.integer(sum(Antwortzeit > FRIST_TAGE,na.rm =T))
+            Verspätet = sum(ist_verspätet(Anfragedatum, Antwortdatum),na.rm=T),
   ) %>% 
   mutate(Pünktlich_Prozent = 100-(Verspätet/Anzahl*100)) %>% 
   pivot_longer(cols=everything(),names_to="Name", values_to="Wert")
